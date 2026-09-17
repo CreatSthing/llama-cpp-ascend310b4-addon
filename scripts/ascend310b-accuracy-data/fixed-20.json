@@ -1,0 +1,22 @@
+[
+  {"id": 1, "question": "2 + 3 等于多少？A.4 B.5 C.6 D.7", "answer": "B"},
+  {"id": 2, "question": "17×6 等于多少？A.92 B.96 C.102 D.112", "answer": "C"},
+  {"id": 3, "question": "中国的首都是哪里？A.上海 B.广州 C.北京 D.深圳", "answer": "C"},
+  {"id": 4, "question": "水的化学式是什么？A.CO2 B.H2O C.O2 D.NaCl", "answer": "B"},
+  {"id": 5, "question": "一年通常有多少个月？A.10 B.11 C.12 D.13", "answer": "C"},
+  {"id": 6, "question": "地球绕哪一个天体公转？A.月球 B.太阳 C.火星 D.木星", "answer": "B"},
+  {"id": 7, "question": "正方形有几条边？A.3 B.4 C.5 D.6", "answer": "B"},
+  {"id": 8, "question": "如果所有猫都是动物，小白是一只猫，那么小白是什么？A.植物 B.动物 C.矿物 D.无法判断", "answer": "B"},
+  {"id": 9, "question": "苹果成熟后通常属于哪类食物？A.水果 B.谷物 C.肉类 D.调味品", "answer": "A"},
+  {"id": 10, "question": "把十进制数字10写成二进制。A.1001 B.1010 C.1100 D.1110", "answer": "B"},
+  {"id": 11, "question": "What is 9 squared? A.18 B.72 C.81 D.99", "answer": "C"},
+  {"id": 12, "question": "Which planet is known as the Red Planet? A.Venus B.Mars C.Jupiter D.Mercury", "answer": "B"},
+  {"id": 13, "question": "What is the opposite of 'hot'? A.cold B.fast C.tall D.dry", "answer": "A"},
+  {"id": 14, "question": "How many days are in a normal week? A.5 B.6 C.7 D.8", "answer": "C"},
+  {"id": 15, "question": "Which gas do humans need to breathe? A.oxygen B.helium C.neon D.argon", "answer": "A"},
+  {"id": 16, "question": "If a book costs $4, how much do three books cost? A.$7 B.$8 C.$12 D.$16", "answer": "C"},
+  {"id": 17, "question": "Which data structure follows first-in, first-out? A.stack B.queue C.tree D.set", "answer": "B"},
+  {"id": 18, "question": "In Python, which keyword defines a function? A.class B.import C.return D.def", "answer": "D"},
+  {"id": 19, "question": "Which number comes next: 2, 4, 6, 8? A.9 B.10 C.11 D.12", "answer": "B"},
+  {"id": 20, "question": "Which is the largest? A.0.5 B.0.05 C.0.005 D.0.0005", "answer": "A"}
+]
