@@ -1,0 +1,8 @@
+experiments/**/input/
+experiments/**/output/
+**/__pycache__/
+*.bin
+*.o
+*.so
+build*/
+out/

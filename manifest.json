@@ -1,0 +1,9 @@
+{
+  "name": "llama.cpp Ascend 310B4 Add-on",
+  "upstream": "https://github.com/ggml-org/llama.cpp.git",
+  "base_commit": "37b3a9e0ccba261d1cc245a971deae0b18c201ab",
+  "source_snapshot_commit": "fe2eac64f427d2af3c72ebc6ef541931420b2e65",
+  "patch": "patches/ascend310b4-llama-cpp.patch",
+  "patch_sha256": "0a55d8507153c915728461eee75ea0774bbddb6f8ce6fa77d1599baad38b1ee2",
+  "changed_files": 37
+}

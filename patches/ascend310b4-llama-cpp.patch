@@ -1,0 +1,3399 @@
+diff --git a/docs/ascend310b-a8w8-accuracy-plan.md b/docs/ascend310b-a8w8-accuracy-plan.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1d35f660d5d7616f03249bece17be667e01b607
+--- /dev/null
++++ b/docs/ascend310b-a8w8-accuracy-plan.md
+@@ -0,0 +1,373 @@
++# Qwen2.5-1.5B A8W8 accuracy experiment
++
++## Question answered
++
++The experiment measures accuracy loss from the two approximate optimizations:
++
++1. dynamic A8W8 for the FFN weights;
++2. dynamic A8W8 for the tied output projection.
++
++The NZ layout optimization only rearranges FP16 data and is retained in the
++reference. It should not introduce quantization loss.
++
++## Controlled comparison
++
++All three runs use the same F16 GGUF, text, tokenization, context size, seed,
++device, and CANN build.
++
++| Group | FFN | tied output | Purpose |
++| --- | --- | --- | --- |
++| A | FP16/NZ | FP16/NZ | reference |
++| B | dynamic A8W8 | FP16/NZ | isolate FFN loss |
++| C | dynamic A8W8 | dynamic A8W8 | measure total and incremental output loss |
++
++The command forces `-b 1 -ub 1`. This is essential because the experimental
++A8W8 path is selected only for an M=1 decode matrix multiplication. A normal
++large-batch perplexity run would silently test the FP16 prefill path instead.
++
++## Metrics and gates
++
++The primary test uses llama.cpp's KL-divergence mode on WikiText-2. It reports
++PPL, KL divergence from FP16, correct-token probability change, RMS probability
++change, and top-token agreement.
++
++Use these initial acceptance gates for group C versus A:
++
++- relative PPL increase no more than 1%;
++- mean KL divergence no more than 0.01;
++- same top token at least 98%;
++- mean correct-token probability loss no worse than 0.5 percentage points.
++
++Group B versus A locates FFN loss. Group C versus B locates the extra loss from
++the output projection. A failure in C alone means the output layer should return
++to FP16/NZ while retaining FFN A8W8.
++
++## Stages
++
++Run `scripts/ascend310b-a8w8-accuracy.sh smoke` first (128-token context), then
++`quick` (512-token context). If quick passes, run `full`, which evaluates eight
++512-token chunks. The reference logits are stored with the logs, so disk use is
++roughly 40 MB for smoke, 160 MB for quick, and 1.2 GB for full.
++
++After the numerical gates pass, run a small deterministic Chinese/English task
++set in all three modes. It should include arithmetic, factual QA, instruction
++following, JSON formatting, and short code generation. Use exact-match or a
++task-specific checker rather than judging prose by eye. This catches behavioral
++changes that corpus perplexity may miss.
++
++## Initial smoke result
++
++The 128-token smoke run completed successfully with the intended M=1 path:
++
++| Group | PPL | PPL change | KL divergence | same top token |
++| --- | ---: | ---: | ---: | ---: |
++| A: FP16/NZ | 5.6811 | reference | reference | reference |
++| B: FFN A8W8 | 5.9434 | +4.6% | 0.02520 | 93.651% |
++| C: FFN + output A8W8 | 6.0944 | +7.3% | 0.03600 | 90.476% |
++
++This sample is too small for a final quality decision: its PPL uncertainty is
++large. It nevertheless fails all provisional numerical gates and demonstrates
++that the decode A8W8 path has measurable loss. Run `quick` next to confirm the
++direction. If confirmed, disable output A8W8 first; its incremental speed gain
++does not justify the observed extra divergence. Then test finer FFN weight
++scales or selective FP16 layers before accepting FFN A8W8.
++
++## 512-token quick result and decision
++
++| Group | PPL | PPL ratio | KL divergence | mean correct-token Δp | same top token |
++| --- | ---: | ---: | ---: | ---: | ---: |
++| A: FP16/NZ | 6.9207 | reference | reference | reference | reference |
++| B: FFN A8W8 | 6.8753 | 0.9934 | 0.02083 | -0.213 pp | 96.078% |
++| C: FFN + output A8W8 | 6.8669 | 0.9922 | 0.03164 | -0.229 pp | 94.510% |
++
++The small PPL decrease is inside the reported uncertainty and is not evidence
++of improved quality. Both A8W8 groups fail the KL and top-token gates. Adding
++output A8W8 increases KL by 0.01080 and reduces top-token agreement by another
++1.568 percentage points, so it should not be the quality-default despite its
++generation-speed gain.
++
++Do not spend board time on the eight-chunk run for this implementation. Keep
++FP16/NZ as the reference/default, keep output A8W8 experimental, and improve
++FFN accuracy before repeating `quick`. The next controlled experiment should
++keep the output in FP16/NZ and retain selected sensitive FFN layers in FP16,
++testing layer blocks from the beginning and end of the network. If that cannot
++meet the gates at useful speed, replace the single per-token activation scale
++with grouped activation scales and repeat the same protocol.
++
++## Selective FFN fallback quick gate (2026-09-16)
++
++The 28 FFN layers were screened in blocks of four. The final candidate keeps
++FFN layers 0–7, 13, and 16–27 in FP16/NZ; only layers 8–12 and 14–15 use
++A8W8. The tied output projection stays FP16/NZ. Every corpus run used
++`-b 1 -ub 1`; the fixed-question runner also reads the prompt one token at a
++time and generates greedily.
++
++| Gate | FP16/NZ | selective A8W8 | limit | outcome |
++| --- | ---: | ---: | ---: | --- |
++| English 256 scored tokens, PPL | 6.9207 | 6.9792 (+0.85%) | +1% | pass |
++| English KL / top-token match | reference | 0.00153 / 99.22% | ≤0.01 / ≥98% | pass |
++| Chinese 256 scored tokens, PPL | 13.9591 | 13.9616 (+0.02%) | +1% | pass |
++| Chinese KL / top-token match | reference | 0.00184 / 98.43% | ≤0.01 / ≥98% | pass |
++| fixed 20 questions | 16/20 | 16/20 | lose at most one | pass |
++| `tg64`, three repeats | 3.10 t/s | 3.35 t/s (+8.1%) | clear gain | provisional |
++
++The English corpus was WikiText-2, including its first 128 tokens used during
++layer selection. The Chinese quick corpus was a small hand-written text repeated
++to satisfy the tool's minimum input length. Therefore this quick gate is a
++screening result, not independent final evidence. The 20 questions were answered
++in one combined prompt; both modes used the same prompt and score parser.
++The table labels the initial one-chunk run as 256 tokens, but the tool scores
++only the final 255 tokens of a 512-token chunk. The corrected quick script uses
++`-c 514` to score exactly 256 tokens and must be run before claiming that this
++specific short gate passed as written.
++
++The speed benefit is much smaller than the unrestricted FFN A8W8 path. Do not
++make this configuration the default until independent 4096–8192-token bilingual
++corpora and C-Eval, GSM8K, HellaSwag, IFEval, and HumanEval comparisons meet
++the formal gates. With roughly 3.35 generated tokens per second and
++single-token corpus evaluation, the formal campaign will take hours rather than
++the five-to-ten-minute quick estimate. Keep both accuracy and performance logs.
++The original `tg64` command generated one token at a time but used llama-bench's
++default context batch settings. Therefore the +8.1% figure is provisional;
++`scripts/ascend310b-a8w8-holdout-speed.sh` explicitly sets `-b 1 -ub 1` and
++repeats both `tg64` and `tg256` three times after the corpus run completes.
++
++## Independent bilingual holdout in progress (2026-09-16)
++
++`scripts/ascend310b-a8w8-holdout.sh` uses 16 chunks of 514 tokens per language,
++scoring exactly 4096 tokens per corpus (256 scored tokens per chunk). It keeps
++`-b 1 -ub 1` for both FP16 and selective
++A8W8, records PPL and full-vocabulary KL/top-token comparison, and keeps the
++tied output in FP16/NZ. English uses WikiText-2 `wiki.valid.raw`, rather than the
++`wiki.test.raw` split used for layer selection. Chinese uses the official C-Eval
++validation questions and answer choices, generated by
++`scripts/ascend310b-ceval-corpus.py`; it is exam-style text, not natural prose.
++
++The run started in the background on the board with logs in
++`accuracy-a8w8/holdout-4096` and a controller log in
++`accuracy-a8w8/holdout-run.log`. Do not report a formal quality pass until both
++languages finish and the task benchmarks and speed gate are checked. Quick-gate
++logs (excluding large `.kld` files) are archived locally in the companion
++workspace's `accuracy/bilingual-256` directory.
++After a successful holdout run, a follow-on process runs the strict
++`-b 1 -ub 1` `tg64`/`tg256` speed comparisons and repeats the corrected quick
++gate at context 514 in `accuracy-a8w8/quick-exact-256`. The follow-on controller
++log is `accuracy-a8w8/holdout-follow-run.log`.
++
++## Edge candidate and layer-output analysis (2026-09-16)
++
++The formal holdout was deliberately stopped before completion because running
++it before selecting the final layer set would require repeating several hours
++of work. Existing block, 255-token bilingual, and new independent 128-token
++results are now used as successive filters.
++
++`scripts/ascend310b-a8w8-edge-screen.sh` compared the current seven-layer A8W8
++set with candidates that add exactly one of layers 13, 16, 17, 18, or 19. On
++the independent WikiText validation prefix, adding layer 16 gave the best PPL
++ratio (0.99980), KL 0.00136, and 99.22% top-token agreement. This is a ranking
++sample rather than a quality pass. `scripts/ascend310b-a8w8-edge-confirm.sh`
++therefore checks the eight-layer candidate (8–12, 14–16) on independent English
++and Chinese 256-token samples, then runs strict `-b 1 -ub 1` `tg64` and `tg256`
++tests with three repeats.
++
++The eval-callback example now supports binary layer dumps through
++`LLAMA_LAYER_DUMP`. It records FP32-normalized `ffn_out-N` and `l_out-N` values;
++`scripts/compare-layer-dumps.py` reports reference-versus-candidate cosine,
++relative L2 error, and the per-layer change in cumulative `l_out` cosine error.
++`scripts/ascend310b-layer-cosine.sh` runs this comparison after the add16 short
++confirmation. Local `ffn_out` error distinguishes the layer's own quantization
++damage, while cumulative `l_out` error detects amplification of errors from
++earlier layers. These values rank candidates only; PPL, KL, top-token agreement,
++fixed questions, task accuracy, and speed remain the acceptance criteria.
++
++Only after the eight-layer candidate meets the short gates (targeting PPL drift
++no greater than 0.95% for margin and at least 10% speed gain) should the exact
++4096-token bilingual holdout run once with
++`GGML_CANN_A8W8_DISABLE_LAYERS=0-7,13,17-27`. Otherwise fall back to the
++seven-layer candidate or test the next ranked single-layer addition.
++
++### Eight-layer add16 result
++
++The candidate quantizing FFN layers 8–12 and 14–16 passed the independent
++256-token bilingual quality screen:
++
++| Gate | English | Chinese | limit |
++| --- | ---: | ---: | ---: |
++| PPL ratio | 1.00255 (+0.26%) | 1.00362 (+0.36%) | ≤1.01 |
++| mean KL | 0.00156 | 0.00130 | ≤0.01 |
++| same top token | 99.22% | 98.83% | ≥98% |
++
++With strict `-b 1 -ub 1`, FP16/NZ measured 4.45 t/s and the candidate measured
++4.85 t/s for both `tg64` and `tg256`, an 8.99% gain. This is a real improvement
++but narrowly misses the experimental 10% target. The layer dump showed tiny
++cumulative residual-stream error through layer 25, followed by a clear increase
++at layer 26: `l_out-25` cosine 0.99999738 / relative L2 0.00229 versus
++`l_out-26` cosine 0.99980619 / relative L2 0.01978. This indicates late-layer
++amplification of accumulated differences even though layer 26 remains FP16;
++it does not by itself prove that layer 26 is locally sensitive.
++
++To test the requested boundary safely, one final short candidate adds layer 18
++as well (A8W8 layers 8–12, 14–16, 18). Layer 18 was the next best independent
++128-token PPL candidate (+0.094%, KL 0.00170). It must pass the same bilingual
++256-token gates and exceed the eight-layer speed result before any long run.
++
++### Nine-layer add16+add18 result
++
++The final boundary candidate quantizes FFN layers 8–12, 14–16, and 18. It also
++passed the independent bilingual 256-token screen:
++
++| Gate | English | Chinese | limit |
++| --- | ---: | ---: | ---: |
++| PPL ratio | 1.00405 (+0.40%) | 1.00447 (+0.45%) | ≤1.01 |
++| mean KL | 0.00178 | 0.00144 | ≤0.01 |
++| same top token | 99.22% | 98.83% | ≥98% |
++
++Strict `-b 1 -ub 1` speed increased from 4.45 to 4.90 t/s for both `tg64` and
++`tg256`, a 10.11% gain. This exceeds the eight-layer candidate's 4.85 t/s while
++retaining substantial short-gate margin. A layer-cosine confirmation is queued,
++followed by the one-time exact 4096-token bilingual holdout using
++`GGML_CANN_A8W8_DISABLE_LAYERS=0-7,13,17,19-27`. The candidate remains
++experimental until the long holdout and task checks pass.
++
++The 4096-token English holdout rejected the nine-layer candidate before the
++last chunk completed: after 15 of 16 equal chunks, top-token agreement was
++97.474%. Even a perfect final chunk could raise the aggregate only to about
++97.63%, below the 98% gate. The run was stopped to save board time. Its PPL and
++KL remained inside their limits, showing why top-token agreement is required in
++addition to average-distribution metrics.
++
++The eight-layer candidate is now the formal candidate. The completed English
++FP16 reference is reused, and `scripts/ascend310b-a8w8-holdout-resume.sh` runs
++the eight-layer English comparison plus the complete Chinese FP16/A8W8 pair.
++This avoids repeating the roughly 35-minute English reference pass.
++
++The eight-layer English holdout also failed the strict top-token gate, but only
++by 0.026 percentage points: PPL ratio 1.001662 (+0.166%), mean KL 0.001550,
++and top-token agreement 97.974%. Because the declared limit is 98%, this is a
++failure rather than a rounded pass. The Chinese eight-layer run was stopped to
++save time, and the formal holdout fell back to the seven-layer candidate
++(A8W8 layers 8–12 and 14–15). The same completed English FP16 reference is
++reused before running the seven-layer Chinese pair.
++
++The user then explicitly selected the eight-layer candidate despite the
++0.026-point top-token miss. It is therefore the intended deployment candidate,
++not a strict-gate pass. The seven-layer fallback run was stopped. The
++eight-layer Chinese 4096-token pair resumed with `SKIP_EN=1`; after it finishes,
++`scripts/ascend310b-a8w8-fixed20-final.sh` automatically compares FP16 and the
++eight-layer candidate on the fixed 20 questions. Reports must preserve the
++distinction between user acceptance and satisfying the original 98% gate.
++
++The Chinese 4096-token holdout passed: PPL ratio 1.002054 (+0.2054%), mean KL
++0.001766, and top-token agreement 98.413%. The fixed 20 questions scored 16/20
++for both FP16 and the eight-layer candidate.
++
++### Realistic prefill/decode PPL mode
++
++Using a larger logical batch with `ubatch=1` produced exactly the same metrics
++as strict `-b 1 -ub 1`, but was 2–4% slower. The physical graph still processed
++one token at a time, so the larger logical submission did not remove the main
++cost.
++
++`LLAMA_PPL_REALISTIC_DECODE=1` now models deployed inference explicitly. The
++first half of each context is processed as a batched FP16 prefill. Its KV cache
++is transferred to a separate context reserved with `ubatch=1`; the scored half
++then runs token by token through the M=1 A8W8 path. On the 514-token Chinese
++check, candidate time fell from 117.78 to 71.12 seconds (39.6% shorter). The
++realistic result was PPL ratio 1.009510 (+0.9510%), mean KL 0.001173, and
++top-token agreement 99.219%, passing all three declared gates. Formal PPL
++scripts use this mode; generation benchmarks remain strict `-b 1 -ub 1`.
++
++### Fast iteration gate and final-eight profiling
++
++During kernel iteration, use a reduced engineering gate to shorten turnaround:
++PPL drift at most 2%, mean KL at most 0.02, top-token agreement at least 97%,
++no more than two lost answers on the fixed 20 questions, and at least 3%
++repeatable generation-speed improvement. English and Chinese use 256 scored
++tokens each. The longer holdout is repeated only after the main optimization
++has stabilized.
++
++The final eight-layer `tg16` msProf run measured a 216.95 ms median token step.
++Device tasks occupied about 202.9 ms (93.5%), leaving about 14 ms (6.5%) in
++dispatch gaps. FP16 MatMulV2 used 144.7 ms/token, the eight-layer custom A8W8
++quant/matmul/dequant chain used about 20.1 ms/token, and the tied output matmul
++alone used about 26.45 ms/token. Both FP16 and INT8 matrix paths were dominated
++by MTE2 weight reads. Gate/Up fusion is therefore a bounded probe: retain it
++only if the combined GEMV improves end-to-end speed by at least 3%; sharing
++input quantization alone cannot meet that threshold.
++
++### Fast 12-layer candidate (relaxed engineering gate)
++
++Reusing Gate's input quantization for Up changed `tg` from 4.86 to 4.87 t/s
++(about 0.2%). The guarded experiment was removed from source because it did
++not reach the 3% end-to-end improvement gate. The output projection A8W8 route
++also remains rejected: although it was faster, its earlier KL of 0.03164 and
++top-token agreement of 94.510% fail even this relaxed quality gate.
++
++The next bounded experiment increased the number of FFN layers using A8W8.
++All comparisons used realistic FP16 prefill and token-by-token scoring on
++256 English and 256 Chinese tokens. Generation speed used `-b 1 -ub 1` with
++three repeats. The fixed 20 questions were checked separately.
++
++| A8W8 FFN layers | English PPL drift | Chinese PPL drift | English / Chinese KL | English / Chinese same top | `tg64` / `tg256` | Fixed 20 |
++| --- | ---: | ---: | ---: | ---: | ---: | ---: |
++| 8–12, 14–16, 18–19 (10) | +1.165% | +0.768% | 0.001744 / 0.001719 | 99.219% / 99.219% | 4.93 / 4.93 t/s | 16/20 |
++| 8–16, 18–19 (11) | +0.833% | −0.195% | 0.002083 / 0.001798 | 99.609% / 100% | 4.99 / 4.99 t/s | 16/20 |
++| 8–19 (12) | +0.973% | +0.553% | 0.002119 / 0.002055 | 99.219% / 99.219% | 5.06 / 5.05 t/s | 16/20 |
++
++The 12-layer candidate passes the relaxed engineering gate. Against the
++4.45 t/s FP16/NZ baseline, `tg256` improves by about 13.5%. Select it with
++`GGML_CANN_A8W8_DISABLE_LAYERS='0-7,20-27'`. This is a fast iteration result,
++not a replacement for the longer bilingual and task holdout before deployment.
++Stop expanding layers for now. Profile this candidate next, then focus on the
++single-token fused A8W8 GEMV path if operator time remains the bottleneck.
++
++The subsequent 4096-token English holdout measured PPL ratio 1.002103
++(+0.2103%), mean KL 0.002245, and 97.363% same-top agreement. It comfortably
++passes the relaxed 97% iteration gate but fails the original 98% deployment
++gate. This confirms the candidate is usable for fast iteration and interactive
++evaluation, while strict deployment should retain the eight-layer choice or
++add targeted mixed-precision protection before promoting the 12-layer version.
++
++The `tg16` msProf capture for the 12-layer candidate is archived at
++`../llama-cpp-310b-workspace/profiling/qwen15b-fast12-tg16-msprof.tar.zst`.
++Across the 17 measured passes, FP16 `MatMulV2` time fell from 2460.22 ms
++(eight layers) to 2125.54 ms; custom INT8 matmul rose from 311.13 to
++466.51 ms as four more layers moved to A8W8. The quant/matmul/dequant chain
++for all 12 layers totaled 510.76 ms, or 30.04 ms/pass, with quantization and
++dequantization only 44.25 ms of that (2.60 ms/pass). The tied output FP16
++matmul still takes about 26.4 ms/pass. MTE2 accounts for 97.2% of the custom
++matmul's measured core activity, indicating that weight movement dominates.
++Therefore, a single-token GEMV layout experiment was a bounded next test;
++combining only the existing quant/dequant launches has limited upside. These percentages are
++profiled core metrics, not a claim that the entire token time is memory I/O.
++
++An isolated AscendC GEMV-mode test changed the M=1 input A layout from ND to
++VECTOR in the custom INT8 matmul, following the [official GEMV guidance](https://www.hiascend.com/document/detail/en/canncommercial/850/opdevg/Ascendcopdevg/atlas_ascendc_10_10019.html). Both
++standalone shapes produced the expected result, but their short-run chain
++latencies moved only from 888.19 to 877.47 us and 854.45 to 852.07 us.
++Paired model `tg64` runs at the same time measured 3.59 t/s with the original
++operator and 3.60 t/s with GEMV mode; absolute throughput was lower than the
++earlier 5.06 t/s session for both variants. This is no defensible end-to-end
++gain, so the experimental operator remains isolated and the original installed
++operator is retained. Further work should target weight-transfer efficiency
++or a better single-token kernel, with paired full-model validation.
++
++### Current-state slowdown probe
++
++A later clean `tg16` msProf capture reproduced the interactive slowdown at
++3.37 t/s under profiling, versus 4.68 t/s in the earlier 12-layer capture.
++Both reports contain the same operator counts, tensor shapes and A8W8 layer
++selection. FP16 `MatMulV2` increased from 2125.54 to 3350.16 ms across the 17
++passes, custom INT8 matmul from 466.51 to 660.68 ms, and `TensorMove` from
++263.39 to 350.01 ms. Small vector operations stayed nearly unchanged.
++`MatMulV2` MTE2 activity rose from 92.4% to 95.1% while its MAC share fell
++from 13.0% to 8.3%; the custom INT8 matmul remained 98.0% MTE2 dominated.
++This points to degraded weight-transfer throughput or device operating state,
++not a graph-path regression. The current report is archived at
++`../llama-cpp-310b-workspace/profiling/qwen15b-fast12-current-tg16-msprof.tar.zst`.
++
++The board reports health codes `80E3A203` (LPM current-reading fault) and
++`80F18003` (DDRA internal configuration error). No competing user NPU process
++was present during the capture. Do not tune quality-sensitive layer selection
++against this degraded absolute speed; compare kernel variants in paired runs,
++and investigate board firmware/EEPROM or reset state separately.
+diff --git a/docs/ascend310b-attention-step-validation.md b/docs/ascend310b-attention-step-validation.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc47939831f5ad6db7585a96f8586b1b833542b8
+--- /dev/null
++++ b/docs/ascend310b-attention-step-validation.md
+@@ -0,0 +1,91 @@
++# Ascend 310B4 decode Attention 适配与验证
++
++验证日期：2026-09-14
++
++## 目标与范围
++
++本次工作为 llama.cpp 的 CANN 后端补充面向 Ascend 310B4 的单 token decode Attention 原型，目标模型为 Qwen2.5-0.5B FP16：
++
++- Query heads：14
++- KV heads：2
++- Head dimension：64
++- 最大上下文：8192
++- 当前只在上述 `head_dim = 64` 条件下启用；不满足条件时继续使用原有 CANN 普通路径。
++
++该算子对应增量推理阶段的 `Q × Kᵀ → mask → softmax → P × V`。设计参考 Ascend 官方开源 `cann-ops-adv` 中的 IncreFlashAttention 数据搬运方式，但本实现仍是面向 310B4 单 AI Core 的轻量原型，不宣称等同于完整 IFA 实现。
++
++官方参考：
++
++- [IFA 算子设计介绍](https://gitee.com/ascend/cann-ops-adv/blob/master/docs/common/IFA%E7%AE%97%E5%AD%90%E8%AE%BE%E8%AE%A1%E4%BB%8B%E7%BB%8D.md)
++- [IncreFlashAttention 文档](https://gitee.com/ascend/cann-ops-adv/blob/9c9579a4ea3f69a8c24ed1cc58f4a517119136c8/docs/IncreFlashAttention.md)
++- 参考源码提交：`e0f6933182bcc757ebcde538fbd635bbc7deadfb`
++
++## 第一阶段：正确性闭环
++
++完成内容：
++
++1. 使用 mask 识别真实有效上下文，避免把 llama.cpp 为复用计算图保留的 KV 存储长度当作有效 token 数。
++2. 修复 MTE2 搬运覆盖临时 KV 缓冲区、而 Vector Cast 尚未读取完成的竞争问题。
++3. 将 Reduce 临时空间扩展到覆盖 8192 token，避免长上下文越界。
++4. 独立探针同时执行 NPU 算子和 CPU Attention 参考实现，并逐元素比较结果。
++5. llama.cpp 端只允许 `head_dim = 64`、单 token Query、上下文不超过 8192 的图走自定义算子，其余配置自动回退。
++
++Qwen 实际 head 配置下的验证结果：
++
++| 有效上下文 | 最大绝对误差 | 结果 |
++| ---: | ---: | :---: |
++| 1 | 0 | PASS |
++| 128 | 3.78676e-06 | PASS |
++| 129 | 3.08827e-06 | PASS |
++| 257 | 1.30292e-06 | PASS |
++| 1024 | 4.60772e-07 | PASS |
++| 2048 | 2.31666e-07 | PASS |
++| 4096 | 5.32018e-08 | PASS |
++| 8192 | 3.84898e-08 | PASS |
++
++此外，127、255、256、511、512、513 均通过。257 和 8192 分别连续运行 5 次，误差完全一致。GQA 组合 `8/2`、`16/4`、`32/8`（Q heads/KV heads）也分别连续运行 3 次通过。
++
++端到端验证使用同一提示词、温度、随机种子和输出长度，对比自定义路径开启/关闭后的文本文件，`cmp` 返回 0，输出逐字节一致。
++
++## 第二阶段：KV 分块搬运与双缓冲
++
++原实现使用一块 `TBuf` 配合手写事件同步。当前实现改为 AscendC 队列生命周期：
++
++```text
++AllocTensor → DataCopy → EnQue → DeQue → Vector compute → FreeTensor
++```
++
++具体调整：
++
++- KV 输入使用 `TQue<QuePosition::VECIN, 2>`，队列深度为 2。
++- K 和 V 均按 tile 搬入 Local Memory 后再转 FP32 计算。
++- tile 从 128 调整为 240：保持 8 元素对齐并处于 Reduce repeat 限制内，同时减少长上下文的分块次数。
++- 不再依赖 K/V 路径中的手写 MTE2/Vector 事件，缓冲区所有权由队列管理。
++
++边界 239、240、241，以及 257、1024、8192 均连续运行 3 次通过 CPU 对照，端到端输出仍与普通路径逐字节一致。
++
++## 性能结果
++
++统一使用 Qwen2.5-0.5B FP16、Ascend 310B4、CANN 8.5、`llama-bench` generation 128 tokens、重复 5 次：
++
++| 路径 | token/s | 说明 |
++| --- | ---: | --- |
++| CANN 普通 Attention | 11.35 | 当前对照基线 |
++| 正确但使用早期 fence 的自定义版本 | 10.71 | 第一阶段稳定基线 |
++| TQue 双缓冲，tile 128 | 10.35 | 队列开销未被充分摊薄 |
++| TQue 双缓冲，tile 240 | 11.10 | 当前第二阶段版本 |
++
++第二阶段相对第一阶段稳定版本提升约 3.64%，但仍比普通 Attention 慢约 2.20%。因此当前结论是：适配已经正确、稳定并接近普通路径，尚不能声称性能领先。
++
++一次 32-token profiling 中，`AttentionStepCustom` 执行 792 次，总耗时 260185.833 us，平均 328.517 us，占采样总耗时 7.589%。板端原始报告位于：
++
++```text
++/home/HwHiAiUser/profiling_llamacpp_tque240_20260914/
++```
++
++## 当前边界与下一步
++
++- 当前原型只覆盖目标模型需要的 `head_dim = 64`；80/128 未作为本阶段适配目标。
++- 双缓冲队列已经建立，但当前 K/V 的搬运与计算仍在单个逻辑流程中，尚未达到成熟 Flash Attention 的充分流水重叠。
++- 下一阶段优先分析单次 328 us 内部的 Vector、搬运和同步占比，再决定是否做更深的分块流水、减少标量同步或改用 Cube 计算。
++- 在性能超过普通路径之前，建议保留回退能力，并把该版本标记为“可运行原型、性能尚未优于基线”。
+diff --git a/docs/ascend310b-qwen25-15b-baseline.md b/docs/ascend310b-qwen25-15b-baseline.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f43a8e55489af135bf221595e3e70dc71c25fa4
+--- /dev/null
++++ b/docs/ascend310b-qwen25-15b-baseline.md
+@@ -0,0 +1,48 @@
++# Qwen2.5-1.5B：第一份 llama.cpp 基线
++
++目的：在任何新优化前，保存一次可重复的 310B4 运行结果。每组由
++`llama-bench -r 3` 测 3 次；同一组结果中的平均值和波动由工具报告。
++
++## 板端运行
++
++先确认 FP16 GGUF 已在板端，且当前 `llama-completion` 和 `llama-bench` 可执行。
++用固定提示词生成一次短文本，保存输出，确认模型不仅能加载，还能
++正常生成：
++
++```bash
++source /usr/local/Ascend/cann/set_env.sh
++GGML_CANN_WEIGHT_NZ=off ./build-cann85/bin/llama-completion \
++  -m ./qwen2.5-1.5b-instruct-f16.gguf -ngl 99 -fa off \
++  -p '请用一句话介绍你自己。' -n 32 --temp 0 -st \
++  2>&1 | tee ./qwen25-15b-smoke.log
++```
++
++确认输出正常后，在板端 `llama-cpp-310b` 目录运行基线：
++
++```bash
++source /usr/local/Ascend/cann/set_env.sh
++GGML_CANN_WEIGHT_NZ=off ./scripts/ascend310b-qwen25-15b-baseline.sh \
++  ./qwen2.5-1.5b-instruct-f16.gguf
++```
++
++如果模型或二进制不在上述位置，可显式传入三个参数：
++
++```bash
++./scripts/ascend310b-qwen25-15b-baseline.sh \
++  /path/to/model.gguf /path/to/llama-bench /path/to/output-dir
++```
++
++脚本保存 `environment.txt` 和四个原始日志：`pp128`、`pp512`、
++`tg64`、`tg256`。`pp` 是读入提示词，`tg` 是逐字生成。它们的速度
++不能混为一个数字。脚本固定 `-ngl 99`、`-fa off` 和每组 3 次；
++默认权重布局 NZ 关闭。后续实验必须使用相同参数对照，并在日志中
++说明改动了哪一个变量。
++
++当前 1.5B 模型的 head dimension 是 128，而自定义 Attention
++只支持 64，因此这份基线先使用 `-fa off`。基线完成后，再单独
++验证 128 维 Attention 和 NZ 权重布局；不要把此前 0.5B 的结果
++视作 1.5B 的性能数据。
++
++完成条件：四组运行均成功；日志显示 CANN 后端和 NPU offload；
++没有 NPU 错误；保存每组 3 次结果和环境信息。若某组失败，保留
++原始日志并记录失败位置，不以其他组的结果代替。
+diff --git a/docs/ascend310b-weight-nz-trials.md b/docs/ascend310b-weight-nz-trials.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..0c3da048e1ba780a428859a34b44e8324dc3b18f
+--- /dev/null
++++ b/docs/ascend310b-weight-nz-trials.md
+@@ -0,0 +1,266 @@
++# Ascend 310B4 weight prepack trials
++
++This log tracks attempts to pre-convert constant matrix weights on Ascend
++310B4 so that decode does not repeatedly pay for ND/private-format `TransData`.
++The experimental path is disabled by default and is enabled with:
++
++```bash
++GGML_CANN_WEIGHT_NZ=on llama-bench ...
++```
++
++## 2026-09-14: CANN 8.5 API capability probe
++
++Environment:
++
++- Device: Ascend 310B4
++- Driver: 23.0.0
++- CANN: 8.5.0 with the 310B ops package
++- Model test shape: FP16 `[896, 896]`
++
++Results:
++
++| API | Result | Detail |
++|---|---|---|
++| `aclnnCalculateMatmulWeightSizeV2` | FAIL | returns `361001` and size `0` |
++| `aclnnTransMatmulWeightGetWorkspaceSize` | PASS | returns a valid executor and 1,606,144-byte workspace |
++| `aclnnTransMatmulWeight` | PASS | executes and synchronizes successfully |
++
++Conclusion: the earlier assumption that the complete NZ path is absent on
++310B4 is too broad. The conversion operation works after the CANN 8.5 upgrade;
++only its allocation-size helper is missing from the installed 310B kernel set.
++
++The current prototype computes the required storage conservatively as FP16
++`ceil(K/16) * ceil(N/16)` elements, matching FRACTAL_NZ's 16x16 blocking, and
++keeps the feature opt-in. Before enabling it by default, the following gates
++must all pass:
++
++1. model load without an overwrite or allocation error;
++2. deterministic output equality against the ND path;
++3. lower `TransData` time/count in `msprof`;
++4. improved `pp512` and/or `tg32` in repeated warm benchmarks.
++
++## 2026-09-14: single-layout model test
++
++The first opt-in implementation replaced every eligible FP16 weight with its
++NZ representation. It established that the converted data is numerically
++usable, but also exposed a shape limit in the 310B Matmul kernels.
++
++| Test | ND | NZ | Result |
++|---|---:|---:|---|
++| `pp8`, one repetition | 26.26 t/s | 77.82 t/s | NZ runs and is 2.96x faster |
++| prompt M=1/2/4/8 | PASS | PASS | NZ kernel available |
++| prompt M=16/32/64 | PASS | FAIL | NZ Matmul path aborts |
++| `tg32`, Flash Attention off | 3.35 t/s | 10.94 t/s | NZ is 3.27x faster |
++| 8-token greedy continuation | `I am trying to create a simple` | same | output matches |
++
++The Flash Attention path failed after `pp8` with both NZ enabled and disabled,
++so that failure is independent of weight packing.
++
++### Revised design
++
++The second prototype retains two copies of each eligible FP16 matrix weight:
++
++- ND at the original tensor address for prefill (`M > 8`);
++- FRACTAL_NZ at a 128-byte-aligned offset for decode/small batches (`M <= 8`).
++
++This costs roughly one additional FP16 model-weight copy, but it allows one
++model instance to serve both prefill and decode. The feature remains opt-in
++until broader model and shape coverage is complete.
++
++## 2026-09-14: dual-layout end-to-end validation
++
++The mixed prefill/decode run passes on the 310B4. Matmuls with `M > 8` use
++the preserved ND weight, while `M <= 8` uses the prepacked NZ copy.
++
++| Test | ND | Dual ND/NZ | Change |
++|---|---:|---:|---:|
++| `pp64`, two repetitions | 196.29 t/s | 246.87 t/s | 1.26x |
++| `tg32`, two repetitions | 3.35 t/s | 10.84 t/s | 3.24x |
++| 20-token prompt, greedy 8-token continuation | 3.22 t/s | 9.61 t/s | 2.98x |
++
++The greedy continuation was identical in both modes:
++
++```text
++ Edge AI inference can reduce network latency for
++```
++
++This validates the layout selection and numerical result for the tested
++Qwen2.5 0.5B FP16 model. It does not yet establish support for quantized
++weights, every model shape, or production use. At the time of this test, Flash
++Attention remained off because the separate experimental 310B custom attention
++path failed with both ND and NZ weights.
++
++## 2026-09-14: custom attention compatibility recheck
++
++The installed `AttentionStepCustom` operator passes its standalone two-head,
++four-position numerical probe. With the current CANN 8.5 build and the same
++Qwen2.5 0.5B FP16 model, the earlier `-fa on` failure did not reproduce:
++
++- `pp64` and `tg32` completed with `GGML_CANN_WEIGHT_NZ=on` and `-fa on`.
++- Two fixed-prompt greedy continuations (12 and 24 tokens) matched `-fa off`.
++- The CANN backend now routes only the tested single-token, 64-wide, FP16-KV
++  shape to the custom operator. Unsupported shapes fall back to another backend.
++
++This is a narrow correctness check, not proof of support for other models or
++long contexts. The previous failure's exact cause remains unknown. Flash
++Attention is still optional; no performance claim is made here.
++
++## 2026-09-15: Qwen2.5-1.5B decode recovery
++
++The dual ND/NZ layout was retested with Qwen2.5-1.5B-Instruct F16 on the
++Ascend 310B4. Flash Attention was disabled so this test isolates weight
++packing. Each case used three repetitions and offloaded all 29 layers.
++
++```bash
++export GGML_CANN_WEIGHT_NZ=on
++./build-cann85/bin/llama-bench \
++  -m ./qwen2.5-1.5b-instruct-f16.gguf \
++  -p 0 -n 64 -r 3 -ngl 99 -fa off
++```
++
++| Test | ND baseline | Dual ND/NZ | Speedup |
++|---|---:|---:|---:|
++| `tg64`, three repetitions | 1.42 t/s | 3.40 t/s | 2.39x |
++| `tg256`, three repetitions | 1.42 t/s | 3.40 t/s | 2.39x |
++
++The longer run matches `tg64`, so the recovered performance is sustained and
++is not a short-generation timing artifact. Keep `GGML_CANN_WEIGHT_NZ=on` for
++the Qwen2.5-1.5B decode baseline while the feature remains opt-in.
++
++## 2026-09-15: double-buffered temporary lifetime fix
++
++Large-M FP32-to-FP16 Matmul needs temporary input and output buffers. Returning
++them immediately to the pool races asynchronous CANN work. Per-buffer events
++were tested first, but event completion was intermittent on this 310B4 runtime:
++independent `pp512` launches failed 2 out of 5 times.
++
++The stable implementation retains two temporary-buffer groups. When a third
++group is needed, it drains the stream once and releases both completed groups.
++This preserves limited overlap without exceeding the board's 16 GB memory.
++Eight retained groups exhausted memory and failed consistently.
++
++Validation with `GGML_CANN_WEIGHT_NZ=on`, `-ngl 99`, and `-fa off`:
++
++| Test | Result |
++|---|---:|
++| `pp512 -r 3` | 121.24 +/- 0.03 token/s |
++| five independent `pp512 -r 1` launches | 5/5 passed |
++| `tg64 -r 3` | 3.39 +/- 0.00 token/s |
++
++## 2026-09-15: Qwen2.5-1.5B tied output weight
++
++The Qwen2.5-1.5B F16 GGUF contains `token_embd.weight` with shape
++`[1536, 151936]`, but no separate `output.weight`. Qwen2 model loading
++reuses the embedding tensor for the final output projection. The existing NZ
++weight classifier recognized `output.weight`, not this tied tensor, so decode
++repacked the 151936-by-1536 output matrix on every generated token.
++
++In the prior `tg64` profile, the 151936-by-1536 ND-to-FRACTAL_NZ conversion
++appeared 65 times and took 4,806,279.96 us in total (73.94 ms/call). A separate
++`GGML_CANN_TIED_OUTPUT_NZ=on` experiment switch now selects only this exact
++FP16 tied-weight shape for the existing dual ND/NZ layout. ND remains available
++for embedding lookup and large-M prefill; NZ serves small-M output Matmul.
++Both `GGML_CANN_WEIGHT_NZ=on` and the new switch are required.
++
++| Test, CANN 8.5, 310B4, `-ngl 99`, `-fa off` | Previous dual ND/NZ | Tied output NZ |
++|---|---:|---:|
++| `tg64 -r 3` | 3.39–3.40 t/s | 4.55 +/- 0.00 t/s |
++| `tg256 -r 3` | 3.40 t/s | 4.55 +/- 0.00 t/s |
++| `pp512 -r 3` | 121.24 t/s | 123.49 +/- 0.01 t/s |
++
++The decode gain is about 34% over the prior NZ baseline. Two independent
++16-token greedy completions of the same fixed prompt, with the tied-weight
++switch off and on, produced byte-identical generated text. This checks the
++tested prompt only, not general numerical equivalence.
++An additional fixed Qwen chat prompt asking `2 + 3` returned `5` in both
++modes and then stopped at end-of-text.
++
++The valid `tg8` profile with the new switch shows the 151936-by-1536 weight
++converted ND-to-FRACTAL_NZ once at load time (85,670.42 us). The
++`aclnnMatmul_TransData_TransData` conversion with that large input shape occurs
++zero times. Output-format conversion after the Matmul still runs per token;
++that is a separate, much smaller operation.
++
++Profile data: `../llama-cpp-310b-workspace/profiling/tied-output-nz-tg8-valid/`.
++Board logs: `/tmp/tied-output-nz-tg64-r3.log`,
++`/tmp/tied-output-nz-tg256-r3.log`, `/tmp/tied-output-nz-pp512-r3.log`, and
++`/tmp/tied-output-answer-{off,on}.log`, and
++`/tmp/tied-output-chat-{off,on}.log`.
++
++## 2026-09-15: post-fix hotspot and Q4 probe
++
++A new optimized `tg32` profile attributes 82.77% of device task time, after
++excluding one-time weight packing, to MatMul. The three FFN projections account
++for 61.77%, and the output projection accounts for 11.90%. The dominant FFN
++kernels report MTE2 execution ratios around 0.906-0.912, consistent with a
++weight-bandwidth-bound decode workload.
++
++A pure Q4_0 probe reduced the model from 2944.68 MiB to 828.59 MiB; pure Q8_0
++reduced it to 1564.62 MiB. Both GGUF formats use weight-only W4A16/W8A16
++inference in the current CANN backend. `aclnnWeightQuantBatchMatmulV2` returns
++error 361001 (`support for Ascend310B is not implemented`) for this path, and
++V3 returns the same error. The V3 probe was reverted after confirmation.
++
++This does not mean that 310B lacks quantized MatMul. The documented Atlas
++inference-series route through `aclnnQuantMatmulV3` is INT8 x INT8 (A8W8), which
++requires dynamic activation quantization and dequantization parameters. The
++current llama.cpp CANN backend does not implement that route. The next probe
++should benchmark A8W8 on M=1 FFN shapes 1536x8960 and 8960x1536 before graph
++integration. A custom W4A16 kernel remains a later option if A8W8 activation
++quantization overhead is too high.
++
++## 2026-09-16: Qwen2.5-1.5B dynamic A8W8 decode experiment
++
++The system `aclnnQuantMatmulV3` binary is unavailable for A8W8 on this 310B4
++installation, so the experiment uses the installed custom operator chain:
++
++1. `W8a8QuantizeCustom`: FP16 activation to per-token INT8 and FP16 scale.
++2. `MatmulW8a8I32Custom`: INT8 by INT8 MatMul with INT32 accumulation.
++3. `W8a8DequantCustom`: multiply the accumulator by activation and per-column
++   weight scales, producing FP16.
++
++The scalar activation quantizer took 245 us for K=1536 and 1,400 us for K=8960.
++Replacing its scalar loops with AscendC vector operations reduced these medians
++to 8.38 us and 15.65 us. The first ND-weight MatMul looked fast in a repeated
++microbenchmark, but an end-to-end profile exposed cold-weight times of 10.25 ms
++and 4.26 ms. Prepacking weights into the 310B INT8 FRACTAL_NZ 16-by-32 layout
++reduced the end-to-end MatMul medians to 1.10 ms and 1.07 ms.
++
++The path is opt-in with `GGML_CANN_A8W8=on`. It only selects Qwen FFN gate, up,
++and down FP16 weights for single-token decode. The original FP16 data remains
++available for prefill. `GGML_CANN_WEIGHT_NZ=on` and
++`GGML_CANN_TIED_OUTPUT_NZ=on` remain enabled for the other decode weights.
++
++| Test, three repetitions | FP16/NZ control | Dynamic A8W8 plus NZ | Change |
++| --- | ---: | ---: | ---: |
++| `tg64` | 3.06 t/s | 4.70 t/s | +53.6% |
++| `tg256` | 3.06 t/s | 4.67 t/s | +52.6% |
++
++A deterministic `2 + 3` prompt produced `5` on both paths. This is a smoke
++check, not a complete accuracy evaluation. The full A8W8 msprof archive and
++benchmark log are stored under the companion workspace `profiling` directory.
++
++Profile archive:
++`../llama-cpp-310b-workspace/profiling/qwen15b-after-tied-nz-tg32.tar.gz`.
++
++## 2026-09-16: tied output dynamic A8W8
++
++The current-best profile still spent about 48 ms per generated token in the
++151936-column tied output projection. `GGML_CANN_TIED_OUTPUT_A8W8=on` now gives
++the exact Qwen2.5-1.5B `token_embd.weight` shape an INT8 FRACTAL_NZ side copy.
++Embedding lookup and prefill continue to use the original FP16 data; only M=1
++output projection uses the dynamic A8W8 chain.
++
++| Test, three repetitions | FFN A8W8 plus tied-output NZ | Tied-output A8W8 | Change |
++| --- | ---: | ---: | ---: |
++| `tg64` | 4.70 t/s | 5.44 t/s | +15.7% |
++| `tg256` | 4.67 t/s | 5.47 t/s | +17.1% |
++| `pp512` | 110.30 t/s | 109.99 t/s | -0.3% |
++
++The fixed `2 + 3` smoke prompt still produced `5`. In the new profile, the
++output MatMul median fell from about 48.0 ms to 18.7 ms. Its one-time INT8
++packing increases model startup time but is not repeated during generation.
++The next largest optimization target is now the per-layer FFN A8W8 MatMul.
++
++Profile archive:
++`../llama-cpp-310b-workspace/profiling/qwen15b-output-a8w8-tg4-msprof.tar.gz`.
+diff --git a/examples/eval-callback/eval-callback.cpp b/examples/eval-callback/eval-callback.cpp
+index 4ce8d600b1a70c10af360fb68cd105697d0c8ea3..44ef7290d1e8a3ba53443d2139ae339e65d40d26 100644
+--- a/examples/eval-callback/eval-callback.cpp
++++ b/examples/eval-callback/eval-callback.cpp
+@@ -1,13 +1,89 @@
+ #include "arg.h"
+ #include "common.h"
+ #include "debug.h"
++#include "ggml-backend.h"
+ #include "log.h"
+ #include "llama.h"
+ 
++#include <algorithm>
+ #include <clocale>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
++struct layer_dump_data {
++    FILE * file = nullptr;
++    std::vector<uint8_t> raw;
++    std::vector<float> values;
++
++    explicit layer_dump_data(const char * path) {
++        file = std::fopen(path, "wb");
++        if (file == nullptr) {
++            throw std::runtime_error(std::string("cannot open layer dump: ") + path);
++        }
++        const char magic[8] = {'L', 'L', 'D', 'U', 'M', 'P', '1', '\0'};
++        std::fwrite(magic, sizeof(magic), 1, file);
++    }
++
++    ~layer_dump_data() {
++        if (file != nullptr) {
++            std::fclose(file);
++        }
++    }
++};
++
++static bool is_layer_output(const char * name) {
++    return std::strncmp(name, "ffn_out-", 8) == 0 || std::strncmp(name, "l_out-", 6) == 0;
++}
++
++static bool layer_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    const bool wanted = is_layer_output(t->name);
++    if (ask || !wanted) {
++        return wanted;
++    }
++    if (!ggml_is_contiguous(t)) {
++        LOG_WRN("skipping non-contiguous layer tensor %s\n", t->name);
++        return true;
++    }
++
++    auto & dump = *(layer_dump_data *) user_data;
++    const int64_t count = ggml_nelements(t);
++    dump.raw.resize(ggml_nbytes(t));
++    const uint8_t * src = nullptr;
++    if (ggml_backend_buffer_is_host(t->buffer)) {
++        src = (const uint8_t *) t->data;
++    } else {
++        ggml_backend_tensor_get(t, dump.raw.data(), 0, dump.raw.size());
++        src = dump.raw.data();
++    }
++
++    dump.values.resize(count);
++    if (t->type == GGML_TYPE_F32) {
++        std::memcpy(dump.values.data(), src, count * sizeof(float));
++    } else if (t->type == GGML_TYPE_F16) {
++        const auto * data = (const ggml_fp16_t *) src;
++        for (int64_t i = 0; i < count; ++i) dump.values[i] = ggml_fp16_to_fp32(data[i]);
++    } else if (t->type == GGML_TYPE_BF16) {
++        const auto * data = (const ggml_bf16_t *) src;
++        for (int64_t i = 0; i < count; ++i) dump.values[i] = ggml_bf16_to_fp32(data[i]);
++    } else {
++        LOG_WRN("skipping unsupported layer tensor type %s for %s\n", ggml_type_name(t->type), t->name);
++        return true;
++    }
++
++    const uint16_t name_len = (uint16_t) std::strlen(t->name);
++    const uint64_t n_values = (uint64_t) count;
++    std::fwrite(&name_len, sizeof(name_len), 1, dump.file);
++    std::fwrite(t->name, name_len, 1, dump.file);
++    std::fwrite(&n_values, sizeof(n_values), 1, dump.file);
++    std::fwrite(dump.values.data(), sizeof(float), count, dump.file);
++    return true;
++}
++
+ static bool run(llama_context * ctx, const common_params & params) {
+     const llama_model * model = llama_get_model(ctx);
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+@@ -26,9 +102,13 @@ static bool run(llama_context * ctx, const common_params & params) {
+         LOG_INF("  %d\n", tokens[i]);
+     }
+ 
+-    if (llama_decode(ctx, llama_batch_get_one(tokens.data(), tokens.size()))) {
+-        LOG_ERR("%s : failed to eval\n", __func__);
+-        return false;
++    const int n_batch = std::max(1, params.n_batch);
++    for (size_t pos = 0; pos < tokens.size(); pos += n_batch) {
++        const int count = std::min<int>(n_batch, tokens.size() - pos);
++        if (llama_decode(ctx, llama_batch_get_one(tokens.data() + pos, count))) {
++            LOG_ERR("%s : failed to eval\n", __func__);
++            return false;
++        }
+     }
+ 
+     return true;
+@@ -38,6 +118,7 @@ int main(int argc, char ** argv) {
+     std::setlocale(LC_NUMERIC, "C");
+ 
+     common_debug_cb_user_data cb_data;
++    std::unique_ptr<layer_dump_data> layer_dump;
+ 
+     common_params params;
+ 
+@@ -52,8 +133,15 @@ int main(int argc, char ** argv) {
+ 
+     // pass the callback to the backend scheduler
+     // it will be executed for each node during the graph computation
+-    params.cb_eval = common_debug_cb_eval;
+-    params.cb_eval_user_data = &cb_data;
++    const char * dump_path = std::getenv("LLAMA_LAYER_DUMP");
++    if (dump_path != nullptr && dump_path[0] != '\0') {
++        layer_dump = std::make_unique<layer_dump_data>(dump_path);
++        params.cb_eval = layer_dump_cb;
++        params.cb_eval_user_data = layer_dump.get();
++    } else {
++        params.cb_eval = common_debug_cb_eval;
++        params.cb_eval_user_data = &cb_data;
++    }
+     params.warmup = false;
+ 
+     // init
+diff --git a/examples/simple/simple.cpp b/examples/simple/simple.cpp
+index 9f0a25d713f46dbc8cfc0a7fe46e455f509c9038..8a5305c252e8cfe602892ff65c03d671b93fba64 100644
+--- a/examples/simple/simple.cpp
++++ b/examples/simple/simple.cpp
+@@ -7,7 +7,7 @@
+ 
+ static void print_usage(int, char ** argv) {
+     printf("\nexample usage:\n");
+-    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [prompt]\n", argv[0]);
++    printf("\n    %s -m model.gguf [-n n_predict] [-ngl n_gpu_layers] [-b batch] [-ub ubatch] [prompt]\n", argv[0]);
+     printf("\n");
+ }
+ 
+@@ -22,6 +22,8 @@ int main(int argc, char ** argv) {
+     int ngl = 99;
+     // number of tokens to predict
+     int n_predict = 32;
++    int n_batch = 512;
++    int n_ubatch = 512;
+ 
+     // parse command line arguments
+ 
+@@ -59,6 +61,22 @@ int main(int argc, char ** argv) {
+                     print_usage(argc, argv);
+                     return 1;
+                 }
++            } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "-ub") == 0) {
++                if (i + 1 >= argc) {
++                    print_usage(argc, argv);
++                    return 1;
++                }
++                try {
++                    const int value = std::stoi(argv[++i]);
++                    if (strcmp(argv[i - 1], "-b") == 0) {
++                        n_batch = value;
++                    } else {
++                        n_ubatch = value;
++                    }
++                } catch (...) {
++                    print_usage(argc, argv);
++                    return 1;
++                }
+             } else {
+                 // prompt starts here
+                 break;
+@@ -112,7 +130,8 @@ int main(int argc, char ** argv) {
+     // n_ctx is the context size
+     ctx_params.n_ctx = n_prompt + n_predict - 1;
+     // n_batch is the maximum number of tokens that can be processed in a single call to llama_decode
+-    ctx_params.n_batch = n_prompt;
++    ctx_params.n_batch = n_batch;
++    ctx_params.n_ubatch = n_ubatch;
+     // enable performance counters
+     ctx_params.no_perf = false;
+ 
+@@ -146,7 +165,9 @@ int main(int argc, char ** argv) {
+ 
+     // prepare a batch for the prompt
+ 
+-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_tokens.size());
++    int prompt_pos = 0;
++    const int prompt_batch = std::min(n_batch, n_prompt);
++    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), prompt_batch);
+ 
+     if (llama_model_has_encoder(model)) {
+         if (llama_encode(ctx, batch)) {
+@@ -177,6 +198,13 @@ int main(int argc, char ** argv) {
+ 
+         n_pos += batch.n_tokens;
+ 
++        if (n_pos < n_prompt) {
++            prompt_pos = n_pos;
++            const int count = std::min(n_batch, n_prompt - prompt_pos);
++            batch = llama_batch_get_one(prompt_tokens.data() + prompt_pos, count);
++            continue;
++        }
++
+         // sample the next token
+         {
+             new_token_id = llama_sampler_sample(smpl, ctx, -1);
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 85a1ae7ae20880c782fe25ad80ba7f9f98f3515b..df19e4eb464cd814733ca22c2e08f28438fcbe02 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2512,6 +2512,12 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    // Optional I32 tensor containing the effective K/V boundary for each mask
++    // row. Backends that do not use it may ignore this input.
++    GGML_API void ggml_flash_attn_ext_add_kv_lengths(
++            struct ggml_tensor * a,
++            struct ggml_tensor * kv_lengths);
++
+     // TODO: needs to be adapted to ggml_flash_attn_ext
+     GGML_API struct ggml_tensor * ggml_flash_attn_back(
+            struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cann/CMakeLists.txt b/ggml/src/ggml-cann/CMakeLists.txt
+index aee5e7b06e51f5f9e36e31389798099d498d7f41..32ceb1498875358e0cd809e10d79969d9dbc2329 100755
+--- a/ggml/src/ggml-cann/CMakeLists.txt
++++ b/ggml/src/ggml-cann/CMakeLists.txt
+@@ -73,6 +73,34 @@ if (CANN_INSTALL_DIR)
+     target_include_directories(ggml-cann PRIVATE ${CANN_INCLUDE_DIRS})
+     target_link_directories(ggml-cann PRIVATE ${CANN_INSTALL_DIR}/lib64)
+ 
++    set(CANN_CUSTOM_OPS_DIR "$ENV{GGML_CANN_CUSTOM_OPS_DIR}" CACHE PATH "Optional CANN custom operator vendor directory")
++    if (EXISTS "${CANN_CUSTOM_OPS_DIR}/op_api/include/aclnn_attention_step_custom.h" AND
++        EXISTS "${CANN_CUSTOM_OPS_DIR}/op_api/lib/libcust_opapi.so")
++        target_compile_definitions(ggml-cann PRIVATE GGML_CANN_HAS_ATTENTION_STEP_CUSTOM)
++        target_include_directories(ggml-cann PRIVATE ${CANN_CUSTOM_OPS_DIR}/op_api/include)
++        target_link_directories(ggml-cann PRIVATE ${CANN_CUSTOM_OPS_DIR}/op_api/lib)
++        target_link_libraries(ggml-cann PRIVATE cust_opapi)
++        message(STATUS "CANN: AttentionStepCustom is available.")
++    endif()
++
++    if (EXISTS "${CANN_CUSTOM_OPS_DIR}/op_api/include/aclnn_w8a8_quantize_custom.h" AND
++        EXISTS "${CANN_CUSTOM_OPS_DIR}/op_api/include/aclnn_matmul_w8a8_i32_custom.h" AND
++        EXISTS "${CANN_CUSTOM_OPS_DIR}/op_api/include/aclnn_w8a8_dequant_custom.h" AND
++        EXISTS "${CANN_CUSTOM_OPS_DIR}/op_api/lib/libcust_opapi.so")
++        target_compile_definitions(ggml-cann PRIVATE GGML_CANN_HAS_A8W8_CUSTOM)
++        target_include_directories(ggml-cann PRIVATE ${CANN_CUSTOM_OPS_DIR}/op_api/include)
++        target_link_directories(ggml-cann PRIVATE ${CANN_CUSTOM_OPS_DIR}/op_api/lib)
++        target_link_libraries(ggml-cann PRIVATE cust_opapi)
++        message(STATUS "CANN: custom A8W8 operators are available.")
++    endif()
++
++    if (EXISTS "${CANN_INSTALL_DIR}/include/aclnnop/aclnn_fused_infer_attention_score_v2.h")
++        target_compile_definitions(ggml-cann PRIVATE GGML_CANN_HAS_FUSED_INFER_ATTENTION_SCORE_V2)
++        message(STATUS "CANN: FusedInferAttentionScoreV2 is available.")
++    else()
++        message(STATUS "CANN: FusedInferAttentionScoreV2 is unavailable; flash attention will use the generic graph.")
++    endif()
++
+     target_compile_definitions(ggml-cann PRIVATE "-D${SOC_TYPE_COMPILE_OPTION}")
+ 
+     if (USE_ACL_GRAPH)
+diff --git a/ggml/src/ggml-cann/aclnn_ops.cpp b/ggml/src/ggml-cann/aclnn_ops.cpp
+index 902d2eda693837c7ea636840facb6725ab0f7746..7daa4fd04c065f6177d7dcdf5f3d9b8e1b534261 100644
+--- a/ggml/src/ggml-cann/aclnn_ops.cpp
++++ b/ggml/src/ggml-cann/aclnn_ops.cpp
+@@ -22,6 +22,12 @@
+ 
+ #include "aclnn_ops.h"
+ 
++#ifdef GGML_CANN_HAS_A8W8_CUSTOM
++#include <aclnn_matmul_w8a8_i32_custom.h>
++#include <aclnn_w8a8_dequant_custom.h>
++#include <aclnn_w8a8_quantize_custom.h>
++#endif
++
+ #include "ggml-impl.h"
+ #include "ggml.h"
+ 
+@@ -43,15 +49,25 @@
+ #include <aclnnop/aclnn_eq_tensor.h>
+ #include <aclnnop/aclnn_exp.h>
+ #include <aclnnop/aclnn_fill_scalar.h>
++#ifdef GGML_CANN_HAS_FUSED_INFER_ATTENTION_SCORE_V2
+ #include <aclnnop/aclnn_fused_infer_attention_score_v2.h>
++#endif
+ #include <aclnnop/aclnn_ger.h>
+ #include <aclnnop/aclnn_group_norm.h>
+ #include <aclnnop/aclnn_gather_v2.h>
++#if __has_include(<aclnnop/aclnn_grouped_matmul_v3.h>)
+ #include <aclnnop/aclnn_grouped_matmul_v3.h>
++#endif
+ #include <aclnnop/aclnn_scatter.h>
+ #include <aclnnop/aclnn_gt_scalar.h>
+ #include <aclnnop/aclnn_im2col.h>
+ #include <aclnnop/aclnn_index_copy.h>
++#ifdef ASCEND_310B
++#include <aclnnop/aclnn_index_put_impl.h>
++#endif
++#ifdef GGML_CANN_HAS_ATTENTION_STEP_CUSTOM
++#include <aclnn_attention_step_custom.h>
++#endif
+ #include <aclnnop/aclnn_index_fill_tensor.h>
+ #include <aclnnop/aclnn_index_select.h>
+ #include <aclnnop/aclnn_layer_norm.h>
+@@ -65,7 +81,9 @@
+ #include <aclnnop/aclnn_permute.h>
+ #include <aclnnop/aclnn_pow.h>
+ #include <aclnnop/aclnn_pow_tensor_tensor.h>
++#if __has_include(<aclnnop/aclnn_recurrent_gated_delta_rule.h>)
+ #include <aclnnop/aclnn_recurrent_gated_delta_rule.h>
++#endif
+ #include <aclnnop/aclnn_reduce_sum.h>
+ #include <aclnnop/aclnn_reflection_pad1d.h>
+ #include <aclnnop/aclnn_repeat.h>
+@@ -1317,6 +1335,45 @@ void ggml_cann_rms_norm(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+     float eps;
+     memcpy(&eps, dst->op_params, sizeof(float));
+ 
++#ifdef ASCEND_310B
++    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++
++    ggml_cann_pool_alloc squared_alloc(ctx.pool(), ggml_nbytes(dst));
++    acl_tensor_ptr squared = ggml_cann_create_tensor(squared_alloc.get(), ACL_FLOAT, sizeof(float), dst->ne, dst->nb,
++                                                     GGML_MAX_DIMS);
++
++    int64_t reduced_ne[] = { 1, src->ne[1], src->ne[2], src->ne[3] };
++    size_t reduced_nb[GGML_MAX_DIMS] = { sizeof(float) };
++    size_t reduced_elements = reduced_ne[0];
++    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
++        reduced_nb[i] = reduced_nb[i - 1] * reduced_ne[i - 1];
++        reduced_elements *= reduced_ne[i];
++    }
++    const size_t reduced_bytes = reduced_elements * sizeof(float);
++    ggml_cann_pool_alloc mean_alloc(ctx.pool(), reduced_bytes);
++    ggml_cann_pool_alloc eps_alloc(ctx.pool(), reduced_bytes);
++    ggml_cann_pool_alloc mean_eps_alloc(ctx.pool(), reduced_bytes);
++    ggml_cann_pool_alloc rms_alloc(ctx.pool(), reduced_bytes);
++    acl_tensor_ptr mean = ggml_cann_create_tensor(mean_alloc.get(), ACL_FLOAT, sizeof(float), reduced_ne, reduced_nb,
++                                                  GGML_MAX_DIMS);
++    acl_tensor_ptr eps_tensor = ggml_cann_create_tensor(eps_alloc.get(), ACL_FLOAT, sizeof(float), reduced_ne,
++                                                        reduced_nb, GGML_MAX_DIMS);
++    acl_tensor_ptr mean_eps = ggml_cann_create_tensor(mean_eps_alloc.get(), ACL_FLOAT, sizeof(float), reduced_ne,
++                                                      reduced_nb, GGML_MAX_DIMS);
++    acl_tensor_ptr rms = ggml_cann_create_tensor(rms_alloc.get(), ACL_FLOAT, sizeof(float), reduced_ne, reduced_nb,
++                                                 GGML_MAX_DIMS);
++    int64_t reduce_dim_value[] = { 3 };
++    acl_int_array_ptr reduce_dim = ggml_cann_create_int_array(reduce_dim_value, 1);
++
++    aclnn_mul(ctx, acl_src.get(), acl_src.get(), squared.get());
++    GGML_CANN_CALL_ACLNN_OP(ctx, Mean, squared.get(), reduce_dim.get(), true, ACL_FLOAT, mean.get());
++    aclnn_fill_scalar(ctx, eps, eps_tensor.get());
++    aclnn_add(ctx, mean.get(), eps_tensor.get(), mean_eps.get());
++    GGML_CANN_CALL_ACLNN_OP(ctx, Sqrt, mean_eps.get(), rms.get());
++    aclnn_div(ctx, acl_src.get(), rms.get(), acl_dst.get());
++    return;
++#endif
++
+     // build gamma.
+     size_t acl_gamma_nb[GGML_MAX_DIMS];
+     // gamma's type is the same with dst.
+@@ -2123,7 +2180,12 @@ void ggml_cann_set_rows(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+                 acl_tensor_ptr acl_src = ggml_cann_create_tensor(
+                     (char *)src_base + i3 * src_nb[3] + i2 * src_nb[2],
+                     acl_type, type_size, s_ne, s_nb_2d, 2);
++#ifdef ASCEND_310B
++                acl_tensor_list_ptr acl_indices = ggml_cann_create_tensor_list(std::move(acl_idx));
++                GGML_CANN_CALL_ACLNN_OP(ctx, IndexPutImpl, acl_dst.get(), acl_indices.get(), acl_src.get(), false, true);
++#else
+                 GGML_CANN_CALL_ACLNN_OP(ctx, InplaceIndexCopy, acl_dst.get(), 0, acl_idx.get(), acl_src.get());
++#endif
+             }
+         }
+     };
+@@ -2222,18 +2284,124 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor *
+                                         bcast_weight_nb[3], bcast_weight_nb[4], bcast_weight_nb[5] };
+     acl_tensor_ptr acl_weight_tensor;
+ 
+-    // Only check env once.
+-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
+-    if (weight_to_nz && weight->type != GGML_TYPE_BF16 && is_matmul_weight(weight)) {
++    // 310B4/CANN 8.5 exposes the NZ conversion itself but not the size-query
++    // helper. Keep the path opt-in there while it is validated on real models.
++#ifdef ASCEND_310B
++    static const bool weight_to_nz =
++        parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("off"));
++#else
++    static const bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
++#endif
++    bool use_nz = weight_to_nz && weight->type != GGML_TYPE_BF16 && is_matmul_weight(weight);
++#ifdef ASCEND_310B
++    // The 310B Matmul private-format kernels cover the small-M decode path,
++    // but fail for M>=16. Keep prefill on the preserved ND copy.
++    use_nz = use_nz && n_dims == 2 && bcast_input_ne[1] <= 8;
++#endif
++    if (use_nz) {
++#ifdef ASCEND_310B
++        ggml_tensor nz_weight = *weight;
++        nz_weight.data = (char *) weight->data + ggml_cann_310b_nz_offset(weight);
++        acl_weight_tensor =
++            ggml_cann_create_tensor(&nz_weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
++#else
+         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_FRACTAL_NZ);
++#endif
+     } else {
+         acl_weight_tensor = ggml_cann_create_tensor(weight, transpose_ne, transpose_nb, n_dims, ACL_FORMAT_ND);
+     }
+     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst, bcast_dst_ne, bcast_dst_nb, n_dims);
+ 
++#if defined(ASCEND_310B) && defined(GGML_CANN_HAS_A8W8_CUSTOM)
++    const bool use_a8w8 = ggml_cann_310b_a8w8_enabled() && ggml_cann_310b_is_a8w8_weight(weight) &&
++                          n_dims == 2 && bcast_input_ne[1] == 1 && input->type == GGML_TYPE_F32 &&
++                          dst->type == GGML_TYPE_F32;
++    if (use_a8w8) {
++        const int64_t k = bcast_input_ne[0];
++        const int64_t n = bcast_dst_ne[0];
++        auto input_f16_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), k * sizeof(uint16_t));
++        auto input_q_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), k * sizeof(int8_t));
++        auto input_scale_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), sizeof(uint16_t));
++        auto accumulator_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), n * sizeof(int32_t));
++        auto output_f16_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), n * sizeof(uint16_t));
++
++        int64_t input_ne[] = { k, 1 };
++        size_t input_f16_nb[] = { sizeof(uint16_t), (size_t) k * sizeof(uint16_t) };
++        size_t input_q_nb[] = { sizeof(int8_t), (size_t) k * sizeof(int8_t) };
++        int64_t scalar_ne[] = { 1 };
++        size_t scalar_nb[] = { sizeof(uint16_t) };
++        int64_t weight_ne[] = { n, k };
++        size_t weight_nb[] = { sizeof(int8_t), (size_t) n * sizeof(int8_t) };
++        int64_t scale_ne[] = { n };
++        size_t scale_nb[] = { sizeof(uint16_t) };
++        int64_t output_ne[] = { n, 1 };
++        size_t accumulator_nb[] = { sizeof(int32_t), (size_t) n * sizeof(int32_t) };
++        size_t output_f16_nb[] = { sizeof(uint16_t), (size_t) n * sizeof(uint16_t) };
++
++        acl_tensor_ptr input_f16 = ggml_cann_create_tensor(input_f16_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                            input_ne, input_f16_nb, 2);
++        acl_tensor_ptr input_q = ggml_cann_create_tensor(input_q_alloc->get(), ACL_INT8, sizeof(int8_t),
++                                                          input_ne, input_q_nb, 2);
++        acl_tensor_ptr input_scale = ggml_cann_create_tensor(input_scale_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                              scalar_ne, scalar_nb, 1);
++        acl_tensor_ptr quant_weight = ggml_cann_create_tensor(
++            (char *) weight->data + ggml_cann_310b_a8w8_offset(weight), ACL_INT8, sizeof(int8_t),
++            weight_ne, weight_nb, 2);
++        acl_tensor_ptr weight_scale = ggml_cann_create_tensor(
++            (char *) weight->data + ggml_cann_310b_a8w8_scale_offset(weight), ACL_FLOAT16, sizeof(uint16_t),
++            scale_ne, scale_nb, 1);
++        acl_tensor_ptr accumulator = ggml_cann_create_tensor(accumulator_alloc->get(), ACL_INT32, sizeof(int32_t),
++                                                              output_ne, accumulator_nb, 2);
++        acl_tensor_ptr output_f16 = ggml_cann_create_tensor(output_f16_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                             output_ne, output_f16_nb, 2);
++
++        aclnn_cast(ctx, acl_input_tensor.get(), input_f16.get(), ACL_FLOAT16);
++        GGML_CANN_CALL_ACLNN_OP(ctx, W8a8QuantizeCustom, input_f16.get(), input_q.get(), input_scale.get());
++        GGML_CANN_CALL_ACLNN_OP(ctx, MatmulW8a8I32Custom, input_q.get(), quant_weight.get(), accumulator.get());
++        GGML_CANN_CALL_ACLNN_OP(ctx, W8a8DequantCustom, accumulator.get(), input_scale.get(), weight_scale.get(),
++                                output_f16.get());
++        aclnn_cast(ctx, output_f16.get(), acl_dst.get(), ACL_FLOAT);
++
++        std::vector<std::unique_ptr<ggml_cann_pool_alloc>> buffers;
++        buffers.push_back(std::move(input_f16_alloc));
++        buffers.push_back(std::move(input_q_alloc));
++        buffers.push_back(std::move(input_scale_alloc));
++        buffers.push_back(std::move(accumulator_alloc));
++        buffers.push_back(std::move(output_f16_alloc));
++        ctx.defer_pool_allocs(std::move(buffers));
++        return;
++    }
++#endif
++
+     switch (n_dims) {
+         case 2:
++#ifdef ASCEND_310B
++            if (input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++                auto input_f16_alloc = std::make_unique<ggml_cann_pool_alloc>(
++                    ctx.pool(), ggml_nelements(input) * sizeof(uint16_t));
++                auto output_f16_alloc = std::make_unique<ggml_cann_pool_alloc>(
++                    ctx.pool(), ggml_nelements(dst) * sizeof(uint16_t));
++                size_t input_f16_nb[] = { sizeof(uint16_t), (size_t) bcast_input_ne[0] * sizeof(uint16_t) };
++                size_t output_f16_nb[] = { sizeof(uint16_t), (size_t) bcast_dst_ne[0] * sizeof(uint16_t) };
++                acl_tensor_ptr input_f16 = ggml_cann_create_tensor(input_f16_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                                    bcast_input_ne, input_f16_nb, 2);
++                acl_tensor_ptr output_f16 = ggml_cann_create_tensor(output_f16_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                                     bcast_dst_ne, output_f16_nb, 2);
++                aclnn_cast(ctx, acl_input_tensor.get(), input_f16.get(), ACL_FLOAT16);
++                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, input_f16.get(), acl_weight_tensor.get(), output_f16.get(), (int8_t) 0);
++                aclnn_cast(ctx, output_f16.get(), acl_dst.get(), ACL_FLOAT);
++                if (bcast_input_ne[1] > 8) {
++                    std::vector<std::unique_ptr<ggml_cann_pool_alloc>> buffers;
++                    buffers.push_back(std::move(input_f16_alloc));
++                    buffers.push_back(std::move(output_f16_alloc));
++                    ctx.defer_pool_allocs(std::move(buffers));
++                }
++            } else {
++                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), (int8_t) 0);
++            }
++#else
+             GGML_CANN_CALL_ACLNN_OP(ctx, Mm, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 2);
++#endif
+             break;
+         case 3:
+             GGML_CANN_CALL_ACLNN_OP(ctx, BatchMatMul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(),
+@@ -2242,7 +2410,39 @@ static void ggml_cann_mat_mul_fp(ggml_backend_cann_context & ctx, ggml_tensor *
+         default:
+             // ALLOW_FP32_DOWN_PRECISION, when input is
+             // fp32, atlas a2 will transpose it to HFLOAT32.
++#ifdef ASCEND_310B
++            if (input->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
++                size_t input_f16_nb[GGML_MAX_DIMS * 2] = { sizeof(uint16_t) };
++                size_t output_f16_nb[GGML_MAX_DIMS * 2] = { sizeof(uint16_t) };
++                size_t input_elements = bcast_input_ne[0];
++                size_t output_elements = bcast_dst_ne[0];
++                for (int64_t i = 1; i < n_dims; ++i) {
++                    input_f16_nb[i] = input_f16_nb[i - 1] * bcast_input_ne[i - 1];
++                    output_f16_nb[i] = output_f16_nb[i - 1] * bcast_dst_ne[i - 1];
++                    input_elements *= bcast_input_ne[i];
++                    output_elements *= bcast_dst_ne[i];
++                }
++                auto input_f16_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), input_elements * sizeof(uint16_t));
++                auto output_f16_alloc = std::make_unique<ggml_cann_pool_alloc>(ctx.pool(), output_elements * sizeof(uint16_t));
++                acl_tensor_ptr input_f16 = ggml_cann_create_tensor(input_f16_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                                    bcast_input_ne, input_f16_nb, n_dims);
++                acl_tensor_ptr output_f16 = ggml_cann_create_tensor(output_f16_alloc->get(), ACL_FLOAT16, sizeof(uint16_t),
++                                                                     bcast_dst_ne, output_f16_nb, n_dims);
++                aclnn_cast(ctx, acl_input_tensor.get(), input_f16.get(), ACL_FLOAT16);
++                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, input_f16.get(), acl_weight_tensor.get(), output_f16.get(), (int8_t) 0);
++                aclnn_cast(ctx, output_f16.get(), acl_dst.get(), ACL_FLOAT);
++                if (bcast_input_ne[1] > 8) {
++                    std::vector<std::unique_ptr<ggml_cann_pool_alloc>> buffers;
++                    buffers.push_back(std::move(input_f16_alloc));
++                    buffers.push_back(std::move(output_f16_alloc));
++                    ctx.defer_pool_allocs(std::move(buffers));
++                }
++            } else {
++                GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 0);
++            }
++#else
+             GGML_CANN_CALL_ACLNN_OP(ctx, Matmul, acl_input_tensor.get(), acl_weight_tensor.get(), acl_dst.get(), 1);
++#endif
+             break;
+     }
+ }
+@@ -2986,8 +3186,8 @@ void ggml_cann_rope(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+ 
+     acl_tensor_ptr acl_src = ggml_cann_create_tensor(src0);
+     acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
+-#ifdef ASCEND_310P
+-    // Special ROPE operation for 310P
++#if defined(ASCEND_310P) || defined(ASCEND_310B)
++    // RoPE fallback for devices without RotaryPositionEmbedding.
+ 
+     // roll input
+     void *               input_roll_buffer;
+@@ -3900,6 +4100,69 @@ void ggml_cann_mul_mat_id(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+ }
+ 
+ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
++#ifndef GGML_CANN_HAS_FUSED_INFER_ATTENTION_SCORE_V2
++#ifdef GGML_CANN_HAS_ATTENTION_STEP_CUSTOM
++    ggml_tensor * q = dst->src[0];
++    ggml_tensor * k = dst->src[1];
++    ggml_tensor * v = dst->src[2];
++    ggml_tensor * mask = dst->src[3];
++    ggml_tensor * kv_lengths = dst->src[5];
++    GGML_ASSERT(q->ne[1] == 1 && q->ne[3] == 1);
++    GGML_ASSERT(k->ne[0] == v->ne[0] && k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2]);
++    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
++    GGML_ASSERT(mask != nullptr && mask->type == GGML_TYPE_F16);
++    GGML_ASSERT(kv_lengths != nullptr && kv_lengths->type == GGML_TYPE_I32 && ggml_nelements(kv_lengths) >= 1);
++
++    const int64_t head_dim = q->ne[0];
++    const int64_t num_q_heads = q->ne[2];
++    const int64_t num_kv_heads = k->ne[2];
++    const int64_t max_seq = k->ne[1];
++    const int64_t kv_dim = num_kv_heads * head_dim;
++    const size_t q_f16_bytes = ggml_nelements(q) * sizeof(uint16_t);
++    ggml_cann_pool_alloc q_f16_alloc(ctx.pool(), q_f16_bytes);
++    ggml_cann_pool_alloc out_f16_alloc(ctx.pool(), q_f16_bytes);
++
++    size_t q_f16_nb[GGML_MAX_DIMS] = { sizeof(uint16_t) };
++    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
++        q_f16_nb[i] = q_f16_nb[i - 1] * q->ne[i - 1];
++    }
++    acl_tensor_ptr acl_q = ggml_cann_create_tensor(q);
++    acl_tensor_ptr acl_q_f16 = ggml_cann_create_tensor(q_f16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), q->ne,
++                                                       q_f16_nb, GGML_MAX_DIMS);
++    acl_tensor_ptr acl_out_f16 = ggml_cann_create_tensor(out_f16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), dst->ne,
++                                                         q_f16_nb, GGML_MAX_DIMS);
++    acl_tensor_ptr acl_dst = ggml_cann_create_tensor(dst);
++    aclnn_cast(ctx, acl_q.get(), acl_q_f16.get(), ACL_FLOAT16);
++
++    int64_t q_ne[] = { head_dim, num_q_heads };
++    size_t q_nb[] = { sizeof(uint16_t), (size_t) head_dim * sizeof(uint16_t) };
++    int64_t kv_ne[] = { kv_dim, max_seq };
++    size_t kv_nb[] = { sizeof(uint16_t), (size_t) kv_dim * sizeof(uint16_t) };
++    int64_t mask_ne[] = { max_seq };
++    size_t mask_nb[] = { sizeof(uint16_t) };
++    int64_t kv_lengths_ne[] = { 1 };
++    size_t kv_lengths_nb[] = { sizeof(int32_t) };
++    acl_tensor_ptr acl_q_step = ggml_cann_create_tensor(q_f16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), q_ne, q_nb, 2);
++    acl_tensor_ptr acl_k = ggml_cann_create_tensor(k->data, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, 2);
++    acl_tensor_ptr acl_v = ggml_cann_create_tensor(v->data, ACL_FLOAT16, sizeof(uint16_t), kv_ne, kv_nb, 2);
++    acl_tensor_ptr acl_mask = ggml_cann_create_tensor(mask->data, ACL_FLOAT16, sizeof(uint16_t), mask_ne, mask_nb, 1);
++    acl_tensor_ptr acl_kv_lengths = ggml_cann_create_tensor(kv_lengths->data, ACL_INT32, sizeof(int32_t),
++                                                            kv_lengths_ne, kv_lengths_nb, 1);
++    acl_tensor_ptr acl_out_step = ggml_cann_create_tensor(out_f16_alloc.get(), ACL_FLOAT16, sizeof(uint16_t), q_ne,
++                                                          q_nb, 2);
++    float scale = 1.0f;
++    memcpy(&scale, (float *) dst->op_params, sizeof(float));
++    GGML_CANN_CALL_ACLNN_OP(ctx, AttentionStepCustom, acl_q_step.get(), acl_k.get(), acl_v.get(), acl_mask.get(),
++                            acl_kv_lengths.get(), max_seq, num_q_heads, num_kv_heads, (double) scale,
++                            acl_out_step.get());
++    aclnn_cast(ctx, acl_out_f16.get(), acl_dst.get(), ACL_FLOAT);
++    return;
++#else
++    GGML_UNUSED(ctx);
++    GGML_UNUSED(dst);
++    GGML_ABORT("FusedInferAttentionScoreV2 is not available in this CANN installation");
++#endif
++#else
+     ggml_tensor * src0 = dst->src[0];  // q, fp32 | B, N, S, D (uncont) -> B, S, N, D (cont)
+     ggml_tensor * src1 = dst->src[1];  // k, fp16 | B, N, S, D (uncont) -> B, S, N, D (cont)
+     ggml_tensor * src2 = dst->src[2];  // v, fp16 | B, N, S, D (uncont) -> B, S, N, D (cont)
+@@ -4177,6 +4440,7 @@ void ggml_cann_flash_attn_ext(ggml_backend_cann_context & ctx, ggml_tensor * dst
+     } else {
+         GGML_ABORT("Function is not implemented.");
+     }
++#endif
+ }
+ 
+ static void ggml_cann_out_prod_fp(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cann/aclnn_ops.h b/ggml/src/ggml-cann/aclnn_ops.h
+index 678f4d654e7f3c93674aa95b530706c1719e970d..0a1a65ead399d3254475907701ffa9e36f6175b0 100644
+--- a/ggml/src/ggml-cann/aclnn_ops.h
++++ b/ggml/src/ggml-cann/aclnn_ops.h
+@@ -988,6 +988,18 @@ void ggml_cann_op_add_rms_norm_fused(ggml_backend_cann_context & ctx,
+  */
+ static bool is_matmul_weight(const ggml_tensor * tensor) {
+     std::string                                  name = ggml_get_name(tensor);
++#ifdef ASCEND_310B
++    // Qwen2.5-1.5B ties its output projection to token_embd.weight. Keep the
++    // ordinary ND copy for embedding lookup and enable an additional NZ copy
++    // only for this known FP16 shape, behind a separate experiment switch.
++    static const bool tied_output_nz =
++        parse_bool(get_env_as_lowercase("GGML_CANN_TIED_OUTPUT_NZ").value_or("off"));
++    if (tied_output_nz && name == "token_embd.weight" && tensor->type == GGML_TYPE_F16 &&
++        tensor->ne[0] == 1536 && tensor->ne[1] == 151936 &&
++        tensor->ne[2] == 1 && tensor->ne[3] == 1) {
++        return true;
++    }
++#endif
+     static const std::unordered_set<std::string> weight_suffixes{ "output.weight",      "attn_q.weight",
+                                                                   "attn_k.weight",      "attn_v.weight",
+                                                                   "attn_output.weight", "ffn_gate.weight",
+@@ -1001,6 +1013,98 @@ static bool is_matmul_weight(const ggml_tensor * tensor) {
+     return false;
+ }
+ 
++static bool ggml_cann_310b_a8w8_enabled() {
++#if defined(ASCEND_310B) && defined(GGML_CANN_HAS_A8W8_CUSTOM)
++    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_A8W8").value_or("off"));
++    return enabled;
++#else
++    return false;
++#endif
++}
++
++static bool ggml_cann_310b_a8w8_layer_disabled(const std::string & name) {
++    const size_t marker = name.find("blk.");
++    if (marker == std::string::npos) {
++        return false;
++    }
++    const size_t first = marker + 4;
++    size_t last = first;
++    while (last < name.size() && name[last] >= '0' && name[last] <= '9') {
++        ++last;
++    }
++    if (last == first) {
++        return false;
++    }
++    const int layer = std::stoi(name.substr(first, last - first));
++    static const std::string disabled =
++        get_env_as_lowercase("GGML_CANN_A8W8_DISABLE_LAYERS").value_or("");
++    size_t pos = 0;
++    while (pos < disabled.size()) {
++        while (pos < disabled.size() && (disabled[pos] == ',' || disabled[pos] == ' ')) {
++            ++pos;
++        }
++        size_t end = pos;
++        while (end < disabled.size() && disabled[end] != ',') {
++            ++end;
++        }
++        const std::string item = disabled.substr(pos, end - pos);
++        if (!item.empty()) {
++            const size_t dash = item.find('-');
++            const int lo = std::stoi(item.substr(0, dash));
++            const int hi = dash == std::string::npos ? lo : std::stoi(item.substr(dash + 1));
++            if (layer >= lo && layer <= hi) {
++                return true;
++            }
++        }
++        pos = end + 1;
++    }
++    return false;
++}
++
++static bool ggml_cann_310b_is_a8w8_weight(const ggml_tensor * tensor) {
++    if (tensor->type != GGML_TYPE_F16 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
++        return false;
++    }
++    const std::string name = ggml_get_name(tensor);
++    static const bool tied_output_a8w8 =
++        parse_bool(get_env_as_lowercase("GGML_CANN_TIED_OUTPUT_A8W8").value_or("off"));
++    const bool ffn = name.find("ffn_gate.weight") != std::string::npos ||
++                     name.find("ffn_up.weight") != std::string::npos ||
++                     name.find("ffn_down.weight") != std::string::npos;
++    return (tied_output_a8w8 && name == "token_embd.weight" &&
++            tensor->ne[0] == 1536 && tensor->ne[1] == 151936) ||
++           (ffn && !ggml_cann_310b_a8w8_layer_disabled(name));
++}
++
++static size_t ggml_cann_310b_a8w8_offset(const ggml_tensor * tensor) {
++    return GGML_PAD(ggml_nbytes(tensor), 128);
++}
++
++static size_t ggml_cann_310b_a8w8_quant_size(const ggml_tensor * tensor) {
++    return (size_t) tensor->ne[0] * (size_t) tensor->ne[1];
++}
++
++static size_t ggml_cann_310b_a8w8_scale_offset(const ggml_tensor * tensor) {
++    return ggml_cann_310b_a8w8_offset(tensor) + ggml_cann_310b_a8w8_quant_size(tensor);
++}
++
++static size_t ggml_cann_310b_a8w8_size(const ggml_tensor * tensor) {
++    return ggml_cann_310b_a8w8_scale_offset(tensor) + (size_t) tensor->ne[1] * sizeof(ggml_fp16_t);
++}
++
++// 310B4 uses a dual-layout allocation while the experimental NZ path is
++// enabled: ordinary ND data stays at the tensor base for prefill, and a
++// prepacked FRACTAL_NZ copy follows it for small-M decode matmuls.
++static size_t ggml_cann_310b_nz_offset(const ggml_tensor * tensor) {
++    return GGML_PAD(ggml_nbytes(tensor), 128);
++}
++
++static size_t ggml_cann_310b_nz_size(const ggml_tensor * tensor) {
++    const size_t padded_ne0 = GGML_PAD((size_t) tensor->ne[0], 16);
++    const size_t padded_ne1 = GGML_PAD((size_t) tensor->ne[1], 16);
++    return padded_ne0 * padded_ne1 * ggml_element_size(tensor);
++}
++
+ /**
+  * @brief Applies a element-wise operation to two input tensors using the CANN
+  * backend.
+diff --git a/ggml/src/ggml-cann/common.h b/ggml/src/ggml-cann/common.h
+index 1c6e685c38cac5de85bf70914a95ce3afc90488b..97e2f564a0360f46cbc21b6d1b8a5c2d88de5ba5 100644
+--- a/ggml/src/ggml-cann/common.h
++++ b/ggml/src/ggml-cann/common.h
+@@ -552,6 +552,10 @@ struct ggml_cann_tensor_cache {
+     int64_t size  = 0;
+ };
+ 
++struct ggml_cann_deferred_pool_allocs {
++    std::vector<std::unique_ptr<ggml_cann_pool_alloc>> buffers;
++};
++
+ /**
+  * @brief Context for managing CANN backend operations.
+  */
+@@ -572,6 +576,8 @@ struct ggml_backend_cann_context {
+     ggml_cann_tensor_cache rms_norm_one_tensor_cache;
+     ggml_cann_tensor_cache rms_norm_zero_tensor_cache;
+ 
++    std::list<ggml_cann_deferred_pool_allocs> deferred_pool_allocs;
++
+     aclrtStream streams[GGML_CANN_MAX_STREAMS] = { nullptr }; /**< Array of streams for the device. */
+ 
+     /**
+@@ -594,6 +600,10 @@ struct ggml_backend_cann_context {
+      */
+     ~ggml_backend_cann_context() {
+         ggml_cann_set_device(device);
++        // Deferred buffers own memory from mem_pool and their events belong to
++        // streams in this context. Finish and release them before either the
++        // streams or the pool are destroyed.
++        reap_deferred_pool_allocs(true);
+         if (copy_event != nullptr) {
+             ACL_CHECK(aclrtDestroyEvent(copy_event));
+         }
+@@ -626,6 +636,30 @@ struct ggml_backend_cann_context {
+      */
+     aclrtStream stream() { return stream(0); }
+ 
++    void reap_deferred_pool_allocs(bool wait_all = false) {
++        if (deferred_pool_allocs.empty()) {
++            return;
++        }
++        if (wait_all) {
++            ACL_CHECK(aclrtSynchronizeStream(stream()));
++        }
++        deferred_pool_allocs.clear();
++    }
++
++    void defer_pool_allocs(std::vector<std::unique_ptr<ggml_cann_pool_alloc>> && buffers) {
++        // Event completion reporting is unreliable for this workload on the
++        // 310B4 runtime. Retain several groups to preserve overlap, then drain
++        // the stream once before returning the entire batch to the pool.
++        // Two groups fit the 16 GB 310B4 while still allowing one operation to
++        // run as the next one is prepared. Larger queues exhaust device memory
++        // during Qwen2.5-1.5B pp512.
++        constexpr size_t max_pending_groups = 2;
++        if (deferred_pool_allocs.size() >= max_pending_groups) {
++            reap_deferred_pool_allocs(true);
++        }
++        deferred_pool_allocs.push_back({ std::move(buffers) });
++    }
++
+     // TODO: each stream should have a memory pool.
+     std::unique_ptr<ggml_cann_pool> mem_pool; /**< Memory pool for the device. */
+ 
+diff --git a/ggml/src/ggml-cann/ggml-cann.cpp b/ggml/src/ggml-cann/ggml-cann.cpp
+index c2745014a19283978b67bd1fa4ce4d99eb6ead63..b48f94253b088a066b3d85119a65721e1938e023 100644
+--- a/ggml/src/ggml-cann/ggml-cann.cpp
++++ b/ggml/src/ggml-cann/ggml-cann.cpp
+@@ -32,7 +32,9 @@
+ #include <aclnnop/aclnn_trans_matmul_weight.h>
+ #include <stdarg.h>
+ 
++#include <algorithm>
+ #include <chrono>
++#include <cinttypes>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -785,6 +787,7 @@ struct TensorSetTracker {
+     std::mutex mtx;                   ///< Protects concurrent access to this tracker
+     size_t bytes_written = 0;         ///< Accumulated bytes written so far
+     size_t total_bytes = 0;           ///< Target size (full tensor)
++    bool nz_initialized = false;      ///< Whether the 310B dual-layout copy was zeroed
+     std::vector<uint8_t> host_buffer; ///< Host staging buffer for quantized tensors
+ };
+ 
+@@ -1223,6 +1226,44 @@ struct ggml_cann_nz_workspace {
+  */
+ static ggml_cann_nz_workspace g_nz_workspaces[GGML_CANN_MAX_DEVICES];
+ 
++static bool ggml_cann_weight_nz_enabled() {
++#ifdef ASCEND_310B
++    // The 310B op package does not implement
++    // aclnnCalculateMatmulWeightSizeV2, but CANN 8.5 does provide a working
++    // aclnnTransMatmulWeight path. Keep this experimental and opt-in until all
++    // model shapes have been checked for correctness and allocation safety.
++    static const bool enabled =
++        parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("off"));
++    return enabled;
++#else
++    static const bool enabled = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
++    return enabled;
++#endif
++}
++
++static void ggml_backend_cann_transform_f16_a8w8(const ggml_tensor * tensor, const void * src, void * dst) {
++    const int64_t k = tensor->ne[0];
++    const int64_t n = tensor->ne[1];
++    const ggml_fp16_t * source = (const ggml_fp16_t *) src;
++    int8_t * quant = (int8_t *) dst;
++    ggml_fp16_t * scales = (ggml_fp16_t *) ((char *) dst + ggml_cann_310b_a8w8_quant_size(tensor));
++
++    for (int64_t column = 0; column < n; ++column) {
++        float max_abs = 0.0f;
++        for (int64_t row = 0; row < k; ++row) {
++            max_abs = std::max(max_abs, std::abs(ggml_fp16_to_fp32(source[column * k + row])));
++        }
++        const float scale = std::max(max_abs / 127.0f, 1.0e-8f);
++        scales[column] = ggml_fp32_to_fp16(scale);
++        for (int64_t row = 0; row < k; ++row) {
++            const float value = ggml_fp16_to_fp32(source[column * k + row]) / scale;
++            const size_t nz_index = ((((size_t) column / 32) * ((size_t) k / 16) + (size_t) row / 16) * 16 +
++                                     (size_t) row % 16) * 32 + (size_t) column % 32;
++            quant[nz_index] = (int8_t) std::max(-127.0f, std::min(127.0f, std::round(value)));
++        }
++    }
++}
++
+ /**
+  * @brief Convert tensor weights to NZ format using Ascend CANN API.
+  *
+@@ -1282,15 +1323,15 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
+ 
+     ggml_cann_set_device(ctx->device);
+ 
+-    // Only check env once.
+-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
++    const bool weight_to_nz = ggml_cann_weight_nz_enabled();
+ 
+     bool is_quantized = need_transform(tensor->type);
+-    bool is_nz        = !is_quantized && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
++    bool is_a8w8      = ggml_cann_310b_a8w8_enabled() && ggml_cann_310b_is_a8w8_weight(tensor);
++    bool is_nz        = !is_quantized && !is_a8w8 && tensor->type != GGML_TYPE_BF16 && weight_to_nz &&
+                  is_matmul_weight((const ggml_tensor *) tensor);
+ 
+     // Plain tensor (not quantized, not NZ): direct copy, no tracking needed
+-    if (!is_quantized && !is_nz) {
++    if (!is_quantized && !is_a8w8 && !is_nz) {
+         ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+         return;
+     }
+@@ -1302,12 +1343,31 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             ggml_backend_cann_transform(tensor, data, transform_buffer);
+             ACL_CHECK(aclrtMemcpy(tensor->data, size, transform_buffer, size, ACL_MEMCPY_HOST_TO_DEVICE));
+             free(transform_buffer);
++        } else if (is_a8w8) {
++            ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
++            const size_t side_size = ggml_cann_310b_a8w8_size(tensor) - ggml_cann_310b_a8w8_offset(tensor);
++            std::vector<uint8_t> side_buffer(side_size);
++            ggml_backend_cann_transform_f16_a8w8(tensor, data, side_buffer.data());
++            ACL_CHECK(aclrtMemcpy((char *) tensor->data + ggml_cann_310b_a8w8_offset(tensor), side_size,
++                                  side_buffer.data(), side_size, ACL_MEMCPY_HOST_TO_DEVICE));
+         } else {
+             // NZ weight
+             GGML_ASSERT(tensor->ne[2] == 1);
+             GGML_ASSERT(tensor->ne[3] == 1);
++#ifdef ASCEND_310B
++            // Keep the ordinary ND copy for prompt batches and build a second
++            // NZ copy for the M<=8 decode path.
++            ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
++            ggml_tensor nz_tensor = *tensor;
++            nz_tensor.data = (char *) tensor->data + ggml_cann_310b_nz_offset(tensor);
++            const size_t nz_size = ggml_cann_310b_nz_size(tensor);
++            ACL_CHECK(aclrtMemset(nz_tensor.data, nz_size, 0, nz_size));
++            ACL_CHECK(aclrtMemcpy(nz_tensor.data, nz_size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
++            weight_format_to_nz(&nz_tensor, ctx->device);
++#else
+             ACL_CHECK(aclrtMemcpy(tensor->data, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
+             weight_format_to_nz(tensor, ctx->device);
++#endif
+         }
+         return;
+     }
+@@ -1316,15 +1376,31 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     TensorSetTracker * tracker = ctx->get_or_create_tracker(tensor);
+     std::unique_lock<std::mutex> lock(tracker->mtx);
+ 
+-    if (is_quantized) {
++    if (is_quantized || is_a8w8) {
+         // Stage data in host buffer; transform requires full tensor data
+         if (tracker->host_buffer.empty()) {
+             tracker->host_buffer.resize(tracker->total_bytes);
+         }
+         memcpy(tracker->host_buffer.data() + offset, data, size);
++        if (is_a8w8) {
++            ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
++        }
+     } else {
+         // NZ weight: upload chunk to device immediately, defer conversion
++#ifdef ASCEND_310B
++        ggml_tensor nz_tensor = *tensor;
++        nz_tensor.data = (char *) tensor->data + ggml_cann_310b_nz_offset(tensor);
++        const size_t nz_size = ggml_cann_310b_nz_size(tensor);
++        if (!tracker->nz_initialized) {
++            ACL_CHECK(aclrtMemset(nz_tensor.data, nz_size, 0, nz_size));
++            tracker->nz_initialized = true;
++        }
+         ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
++        ACL_CHECK(aclrtMemcpy((char *) nz_tensor.data + offset, nz_size - offset, data, size,
++                             ACL_MEMCPY_HOST_TO_DEVICE));
++#else
++        ACL_CHECK(aclrtMemcpy((char *) tensor->data + offset, size, data, size, ACL_MEMCPY_HOST_TO_DEVICE));
++#endif
+     }
+ 
+     tracker->bytes_written += size;
+@@ -1338,10 +1414,24 @@ static void ggml_backend_cann_buffer_set_tensor(ggml_backend_buffer_t buffer,
+             free(transform_buffer);
+         }
+ 
++        if (is_a8w8) {
++            const size_t side_size = ggml_cann_310b_a8w8_size(tensor) - ggml_cann_310b_a8w8_offset(tensor);
++            std::vector<uint8_t> side_buffer(side_size);
++            ggml_backend_cann_transform_f16_a8w8(tensor, tracker->host_buffer.data(), side_buffer.data());
++            ACL_CHECK(aclrtMemcpy((char *) tensor->data + ggml_cann_310b_a8w8_offset(tensor), side_size,
++                                  side_buffer.data(), side_size, ACL_MEMCPY_HOST_TO_DEVICE));
++        }
++
+         if (is_nz) {
+             GGML_ASSERT(tensor->ne[2] == 1);
+             GGML_ASSERT(tensor->ne[3] == 1);
++#ifdef ASCEND_310B
++            ggml_tensor nz_tensor = *tensor;
++            nz_tensor.data = (char *) tensor->data + ggml_cann_310b_nz_offset(tensor);
++            weight_format_to_nz(&nz_tensor, ctx->device);
++#else
+             weight_format_to_nz(tensor, ctx->device);
++#endif
+         }
+ 
+         // Unlock before removing tracker, as remove_tracker destroys the mutex
+@@ -1550,8 +1640,7 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
+     size_t  size = ggml_nbytes(tensor);
+     int64_t ne0  = tensor->ne[0];
+ 
+-    // Only check env once.
+-    static bool weight_to_nz = parse_bool(get_env_as_lowercase("GGML_CANN_WEIGHT_NZ").value_or("on"));
++    const bool weight_to_nz = ggml_cann_weight_nz_enabled();
+ 
+     // last line must bigger than 32, because every single op deal at
+     // least 32 bytes.
+@@ -1563,10 +1652,18 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
+         if (ne0 % MATRIX_ROW_PADDING != 0) {
+             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+         }
++    } else if (ggml_cann_310b_a8w8_enabled() && ggml_cann_310b_is_a8w8_weight(tensor)) {
++        size = ggml_cann_310b_a8w8_size(tensor);
+     } else if (weight_to_nz && tensor->type != GGML_TYPE_BF16
+                && is_matmul_weight((const ggml_tensor *) tensor)) {
+         // NZ format weight are not support quantized yet.
+         // If ND tensor transform to NZ, size may changed.
++#ifdef ASCEND_310B
++        // aclnnCalculateMatmulWeightSizeV2 returns 361001 on 310B4 even though
++        // aclnnTransMatmulWeight itself is available. Preserve ND for prefill
++        // and reserve a second, 128-byte-aligned FRACTAL_NZ copy for decode.
++        size = ggml_cann_310b_nz_offset(tensor) + ggml_cann_310b_nz_size(tensor);
++#else
+         int64_t shape[] = { tensor->ne[1], tensor->ne[0] };
+         GGML_ASSERT(tensor->ne[2] == 1);
+         GGML_ASSERT(tensor->ne[3] == 1);
+@@ -1575,6 +1672,7 @@ static size_t ggml_backend_cann_buffer_type_get_alloc_size(ggml_backend_buffer_t
+         ACL_CHECK(aclnnCalculateMatmulWeightSizeV2(acl_shape, ggml_cann_type_mapping(tensor->type), &new_size));
+         ACL_CHECK(aclDestroyIntArray(acl_shape));
+         size = std::max(size, new_size);
++#endif
+     }
+ 
+     return size;
+@@ -1690,6 +1788,12 @@ static void ggml_backend_cann_host_buffer_free(ggml_backend_buffer_t buffer) {
+  * @return Pointer to the allocated host buffer, or nullptr if allocation fails.
+  */
+ static void * ggml_cann_host_malloc(size_t size) {
++#ifdef ASCEND_310B
++    // aclrtMallocHost on 310B does not guarantee the alignment required by
++    // ggml's host tensors. Use the existing aligned CPU-buffer fallback.
++    GGML_UNUSED(size);
++    return nullptr;
++#endif
+     if (getenv("GGML_CANN_NO_PINNED") != nullptr) {
+         return nullptr;
+     }
+@@ -2058,10 +2162,13 @@ static const char * ggml_backend_cann_name(ggml_backend_t backend) {
+  */
+ static void ggml_backend_cann_free(ggml_backend_t backend) {
+     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
++    const int32_t device = cann_ctx->device;
++    ggml_cann_set_device(device);
+     ACL_CHECK(aclrtSynchronizeDevice());
+-    ACL_CHECK(aclrtResetDevice(cann_ctx->device));
+-
++    cann_ctx->reap_deferred_pool_allocs(true);
+     delete cann_ctx;
++    // Reset only after the context has released its events, streams and pool.
++    ACL_CHECK(aclrtResetDevice(device));
+     delete backend;
+ }
+ 
+@@ -2209,6 +2316,7 @@ static void ggml_backend_cann_synchronize(ggml_backend_t backend) {
+     ggml_backend_cann_context * cann_ctx = (ggml_backend_cann_context *) backend->context;
+     ggml_cann_set_device(cann_ctx->device);
+     ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
++    cann_ctx->reap_deferred_pool_allocs(false);
+ }
+ 
+ /**
+@@ -2270,6 +2378,14 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
+     // Only perform the graph execution if CANN graphs are not enabled, or we are capturing the graph.
+     // With the use of CANN graphs, the execution will be performed by the graph launch.
+     static bool opt_fusion = parse_bool(get_env_as_lowercase("GGML_CANN_OPERATOR_FUSION").value_or(""));
++    static bool trace_node_sync =
++        parse_bool(get_env_as_lowercase("GGML_CANN_TRACE_NODE_SYNC").value_or("off"));
++    static bool trace_sync_mul_mat =
++        parse_bool(get_env_as_lowercase("GGML_CANN_TRACE_SYNC_MUL_MAT").value_or("off"));
++    static bool trace_sync_set_rows =
++        parse_bool(get_env_as_lowercase("GGML_CANN_TRACE_SYNC_SET_ROWS").value_or("off"));
++    static bool trace_sync_rope =
++        parse_bool(get_env_as_lowercase("GGML_CANN_TRACE_SYNC_ROPE").value_or("off"));
+ 
+     if (!use_cann_graph || cann_graph_capture_required) {
+         for (int i = 0; i < cgraph->n_nodes; i++) {
+@@ -2291,11 +2407,25 @@ static void evaluate_and_capture_cann_graph(ggml_backend_cann_context * cann_ctx
+                 continue;
+             }
+ 
++            const bool trace_sync_this_node = trace_node_sync ||
++                (trace_sync_mul_mat && node->op == GGML_OP_MUL_MAT) ||
++                (trace_sync_set_rows && node->op == GGML_OP_SET_ROWS) ||
++                (trace_sync_rope && node->op == GGML_OP_ROPE);
++            if (trace_sync_this_node) {
++                GGML_LOG_ERROR("CANN trace: node=%d name=%s op=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] begin\n",
++                               i, node->name, ggml_op_name(node->op),
++                               node->ne[0], node->ne[1], node->ne[2], node->ne[3]);
++            }
+             bool ok = ggml_cann_compute_forward(*cann_ctx, node);
+             if (!ok) {
+                 GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+             }
+             GGML_ASSERT(ok);
++            if (trace_sync_this_node) {
++                ACL_CHECK(aclrtSynchronizeStream(cann_ctx->stream()));
++                GGML_LOG_ERROR("CANN trace: node=%d name=%s op=%s complete\n",
++                               i, node->name, ggml_op_name(node->op));
++            }
+         }
+     }
+ 
+@@ -2544,7 +2674,7 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+                 if (op->src[0]->ne[0] > 896) {
+                     return false;
+                 }
+-#ifdef ASCEND_310P
++#if defined(ASCEND_310P) || defined(ASCEND_310B)
+                 // TODO: Support rope_dim < ne00(dim)
+                 if (op->src[0]->ne[0] != op->op_params[1]) {
+                     return false;
+@@ -2606,7 +2736,6 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+         case GGML_OP_SUB:
+         case GGML_OP_MUL:
+         case GGML_OP_DIV:
+-        case GGML_OP_RMS_NORM:
+         case GGML_OP_SQR:
+         case GGML_OP_SQRT:
+         case GGML_OP_CLAMP:
+@@ -2632,6 +2761,12 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+         case GGML_OP_COUNT_EQUAL:
+         case GGML_OP_GATED_LINEAR_ATTN:
+             return true;
++        case GGML_OP_RMS_NORM:
++#ifdef ASCEND_310B
++            return op->type == GGML_TYPE_F32;
++#else
++            return true;
++#endif
+         case GGML_OP_OUT_PROD:
+             {
+ #ifdef ASCEND_310P
+@@ -2660,6 +2795,31 @@ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_ten
+             return true;
+         case GGML_OP_FLASH_ATTN_EXT:
+             {
++#ifndef GGML_CANN_HAS_FUSED_INFER_ATTENTION_SCORE_V2
++#ifndef GGML_CANN_HAS_ATTENTION_STEP_CUSTOM
++                return false;
++#endif
++#endif
++#ifdef GGML_CANN_HAS_ATTENTION_STEP_CUSTOM
++                const ggml_tensor * q = op->src[0];
++                const ggml_tensor * k = op->src[1];
++                const ggml_tensor * v = op->src[2];
++                const ggml_tensor * mask = op->src[3];
++                const ggml_tensor * kv_lengths = op->src[5];
++                const size_t kv_row_bytes = (size_t) k->ne[0] * (size_t) k->ne[2] * sizeof(uint16_t);
++                if (!mask || !kv_lengths || q->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
++                    mask->type != GGML_TYPE_F16 || kv_lengths->type != GGML_TYPE_I32 ||
++                    ggml_nelements(kv_lengths) < 1 || !ggml_is_contiguous(kv_lengths) ||
++                    q->ne[0] != 64 || q->ne[1] != 1 || q->ne[3] != 1 || k->ne[1] < 1 || k->ne[1] > 8192 ||
++                    k->ne[2] < 1 || k->ne[3] != 1 || v->ne[3] != 1 ||
++                    q->ne[2] % k->ne[2] != 0 || k->ne[0] != q->ne[0] || v->ne[0] != k->ne[0] ||
++                    v->ne[1] != k->ne[1] || v->ne[2] != k->ne[2] || mask->ne[0] < k->ne[1] ||
++                    k->nb[0] != sizeof(uint16_t) || k->nb[1] != kv_row_bytes || k->nb[2] != k->ne[0] * sizeof(uint16_t) ||
++                    v->nb[0] != sizeof(uint16_t) || v->nb[1] != kv_row_bytes || v->nb[2] != v->ne[0] * sizeof(uint16_t) ||
++                    mask->nb[0] != sizeof(uint16_t)) {
++                    return false;
++                }
++#endif
+ #ifdef ASCEND_310P
+                 // FA not support on 310p device
+                 return false;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 0dfa44dbf65a452552a7ec7a510fa82b8c7df6ad..25e6aceae7b629f1025c4f4c58b6d1d0a9ade729 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -20369,6 +20369,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
+             if (src_clone[4]) {
+                 ggml_flash_attn_ext_add_sinks(tensor_clone, src_clone[4]);
+             }
++            if (src_clone[5]) {
++                ggml_flash_attn_ext_add_kv_lengths(tensor_clone, src_clone[5]);
++            }
+         } else if (tensor->op == GGML_OP_MUL_MAT) {
+             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
+         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5ef03e190e34a04295f6622f59515ec6a88b8deb..95fd0ec5c81d02f4267962204efdc508c26458a9 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5583,6 +5583,22 @@ void ggml_flash_attn_ext_add_sinks(
+     a->src[4] = sinks;
+ }
+ 
++void ggml_flash_attn_ext_add_kv_lengths(
++        struct ggml_tensor * a,
++        struct ggml_tensor * kv_lengths) {
++    if (!kv_lengths) {
++        a->src[5] = NULL;
++        return;
++    }
++
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(a->src[5] == NULL);
++    GGML_ASSERT(kv_lengths->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_contiguous(kv_lengths));
++
++    a->src[5] = kv_lengths;
++}
++
+ // ggml_flash_attn_back
+ 
+ struct ggml_tensor * ggml_flash_attn_back(
+diff --git a/scripts/ascend310b-a8w8-accuracy.sh b/scripts/ascend310b-a8w8-accuracy.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f1f60329fff589b8344c06632e5a0517473e556
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-accuracy.sh
+@@ -0,0 +1,64 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Accuracy comparison for the Qwen2.5-1.5B 310B4 decode-only A8W8 path.
++# PPL uses batched FP16 prefill and a separate ubatch=1 context for the scored
++# decode half. Generation speed tests still use b=1/ub=1.
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++MODE=${1:-quick}
++OUT=${OUT:-$ROOT/accuracy-a8w8/$MODE}
++CORPUS=${CORPUS:-$ROOT/wikitext-2-raw/wiki.test.raw}
++
++case "$MODE" in
++    smoke) CTX=128; CHUNKS=1 ;;
++    quick) CTX=512; CHUNKS=1 ;;
++    full)  CTX=512; CHUNKS=8 ;;
++    *) echo "usage: $0 [smoke|quick|full]" >&2; exit 2 ;;
++esac
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++
++mkdir -p "$OUT"
++if [[ ! -f "$CORPUS" ]]; then
++    archive="$ROOT/wikitext-2-raw-v1.zip"
++    curl -L "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip" -o "$archive"
++    (cd "$ROOT" && unzip -o "$archive" >/dev/null)
++    rm -f "$archive"
++fi
++
++PPL="$BUILD/bin/llama-perplexity"
++if [[ ! -x "$PPL" ]]; then
++    cmake --build "$BUILD" --target llama-perplexity -j4
++fi
++
++common=("$PPL" -m "$MODEL" -f "$CORPUS" -ngl 99 -fa 0 \
++        -c "$CTX" -b "$CTX" -ub "$CTX" --chunks "$CHUNKS" --seed 1234)
++
++export LLAMA_PPL_REALISTIC_DECODE=1
++base_logits="$OUT/fp16-reference.kld"
++
++echo "[1/3] FP16/NZ reference"
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "${common[@]}" --kl-divergence-base "$base_logits" \
++    2>&1 | tee "$OUT/01-fp16-reference.log"
++
++echo "[2/3] FFN dynamic A8W8, FP16/NZ output"
++env GGML_CANN_A8W8=on GGML_CANN_WEIGHT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "${common[@]}" --kl-divergence-base "$base_logits" --kl-divergence \
++    2>&1 | tee "$OUT/02-ffn-a8w8.log"
++
++echo "[3/3] FFN plus tied-output dynamic A8W8"
++env GGML_CANN_A8W8=on GGML_CANN_WEIGHT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_NZ=off GGML_CANN_TIED_OUTPUT_A8W8=on \
++    "${common[@]}" --kl-divergence-base "$base_logits" --kl-divergence \
++    2>&1 | tee "$OUT/03-full-a8w8.log"
++
++echo "Results: $OUT"
+diff --git a/scripts/ascend310b-a8w8-bilingual-gate.sh b/scripts/ascend310b-a8w8-bilingual-gate.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..7e209aa17f9dcdde0dccce4eadb92cb46fc3c555
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-bilingual-gate.sh
+@@ -0,0 +1,62 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/bilingual-256}
++EN=${EN:-$ROOT/wikitext-2-raw/wiki.test.raw}
++ZH=${ZH:-$ROOT/scripts/ascend310b-accuracy-data/zh-quick.txt}
++QUESTIONS=${QUESTIONS:-$ROOT/scripts/ascend310b-accuracy-data/fixed-20.json}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,16-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++cmake --build "$BUILD" --target llama-perplexity llama-simple llama-bench -j4
++ppl="$BUILD/bin/llama-perplexity"
++export LLAMA_PPL_REALISTIC_DECODE=1
++common=(-ngl 99 -fa 0 -c 514 -b 514 -ub 514 --chunks 1 --seed 1234)
++cat "$ZH" "$ZH" "$ZH" > "$OUT/zh-expanded.txt"
++
++for lang in en zh; do
++    if [[ "$lang" == en ]]; then corpus="$EN"; else corpus="$OUT/zh-expanded.txt"; fi
++    ref="$OUT/$lang-fp16.kld"
++    echo "[$lang] FP16 reference, batch=1, ubatch=1"
++    env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++        GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" -m "$MODEL" -f "$corpus" "${common[@]}" --kl-divergence-base "$ref" \
++        2>&1 | tee "$OUT/$lang-fp16.log"
++
++    echo "[$lang] selective A8W8, FP16 layers $DISABLED_LAYERS, batch=1, ubatch=1"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" -m "$MODEL" -f "$corpus" "${common[@]}" \
++        --kl-divergence-base "$ref" --kl-divergence \
++        2>&1 | tee "$OUT/$lang-candidate.log"
++done
++
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    python3 "$ROOT/scripts/ascend310b-fixed20.py" \
++    --cli "$BUILD/bin/llama-simple" --model "$MODEL" --questions "$QUESTIONS" \
++    --mode fp16 --output "$OUT/fixed20-fp16.json"
++env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    python3 "$ROOT/scripts/ascend310b-fixed20.py" \
++    --cli "$BUILD/bin/llama-simple" --model "$MODEL" --questions "$QUESTIONS" \
++    --mode candidate --output "$OUT/fixed20-candidate.json"
++
++echo "[speed] FP16/NZ"
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    "$BUILD/bin/llama-bench" -m "$MODEL" -p 0 -n 64 -r 3 -b 1 -ub 1 -ngl 99 -fa 0 \
++    2>&1 | tee "$OUT/speed-fp16.log"
++echo "[speed] selective A8W8"
++env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$BUILD/bin/llama-bench" -m "$MODEL" -p 0 -n 64 -r 3 -b 1 -ub 1 -ngl 99 -fa 0 \
++    2>&1 | tee "$OUT/speed-candidate.log"
++
++echo "Results: $OUT"
+diff --git a/scripts/ascend310b-a8w8-edge-confirm.sh b/scripts/ascend310b-a8w8-edge-confirm.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a978836389266939ccdafbd567edf43966cacd4
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-edge-confirm.sh
+@@ -0,0 +1,46 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/edge-confirm-add16}
++EN=${EN:-$ROOT/wikitext-2-raw/wiki.valid.raw}
++ZH=${ZH:-$ROOT/accuracy-a8w8/ceval-val-corpus.txt}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,17-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++ppl="$BUILD/bin/llama-perplexity"
++export LLAMA_PPL_REALISTIC_DECODE=1
++common=(-m "$MODEL" -ngl 99 -fa 0 -c 514 -b 514 -ub 514 --chunks 1 --seed 1234)
++
++for lang in en zh; do
++    if [[ "$lang" == en ]]; then corpus="$EN"; else corpus="$ZH"; fi
++    ref="$OUT/$lang-fp16.kld"
++    env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++        GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" "${common[@]}" -f "$corpus" --kl-divergence-base "$ref" \
++        2>&1 | tee "$OUT/$lang-fp16.log"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" "${common[@]}" -f "$corpus" --kl-divergence-base "$ref" --kl-divergence \
++        2>&1 | tee "$OUT/$lang-candidate.log"
++done
++
++for tokens in 64 256; do
++    env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++        GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$BUILD/bin/llama-bench" -m "$MODEL" -p 0 -n "$tokens" -r 3 \
++        -b 1 -ub 1 -ngl 99 -fa 0 2>&1 | tee "$OUT/tg$tokens-fp16.log"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$BUILD/bin/llama-bench" -m "$MODEL" -p 0 -n "$tokens" -r 3 \
++        -b 1 -ub 1 -ngl 99 -fa 0 2>&1 | tee "$OUT/tg$tokens-candidate.log"
++done
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-a8w8-edge-screen.sh b/scripts/ascend310b-a8w8-edge-screen.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..4971ea959462ac778d46733d2c42a9ad34390757
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-edge-screen.sh
+@@ -0,0 +1,44 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/edge-screen}
++CORPUS=${CORPUS:-$ROOT/wikitext-2-raw/wiki.valid.raw}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++ppl="$BUILD/bin/llama-perplexity"
++export LLAMA_PPL_REALISTIC_DECODE=1
++common=(-m "$MODEL" -f "$CORPUS" -ngl 99 -fa 0 -c 258 -b 258 -ub 258 --chunks 1 --seed 1234)
++ref="$OUT/fp16.kld"
++
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" --kl-divergence-base "$ref" 2>&1 | tee "$OUT/fp16.log"
++
++# Current seven-layer candidate plus exactly one extra A8W8 layer per trial.
++names=(current add13 add16 add17 add18 add19)
++disabled=(
++    '0-7,13,16-27'
++    '0-7,16-27'
++    '0-7,13,17-27'
++    '0-7,13,16,18-27'
++    '0-7,13,16-17,19-27'
++    '0-7,13,16-18,20-27'
++)
++
++for i in "${!names[@]}"; do
++    echo "[${names[$i]}] FP16 layers ${disabled[$i]}"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="${disabled[$i]}" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" "${common[@]}" --kl-divergence-base "$ref" --kl-divergence \
++        2>&1 | tee "$OUT/${names[$i]}.log"
++done
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-a8w8-fixed20-final.sh b/scripts/ascend310b-a8w8-fixed20-final.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..42346a61493cf1047f18275e7208344289b9a554
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-fixed20-final.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/holdout-4096-add16}
++QUESTIONS=${QUESTIONS:-$ROOT/scripts/ascend310b-accuracy-data/fixed-20.json}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,17-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_A8W8=off \
++    python3 "$ROOT/scripts/ascend310b-fixed20.py" \
++    --cli "$BUILD/bin/llama-simple" --model "$MODEL" --questions "$QUESTIONS" \
++    --mode fp16 --output "$OUT/fixed20-fp16.json"
++
++env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    python3 "$ROOT/scripts/ascend310b-fixed20.py" \
++    --cli "$BUILD/bin/llama-simple" --model "$MODEL" --questions "$QUESTIONS" \
++    --mode candidate --output "$OUT/fixed20-candidate.json"
++
++echo "completed: $OUT/fixed20-*.json"
+diff --git a/scripts/ascend310b-a8w8-holdout-resume.sh b/scripts/ascend310b-a8w8-holdout-resume.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..f900efd50e55ccc181a30b9baed1d01157e996c4
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-holdout-resume.sh
+@@ -0,0 +1,48 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/holdout-4096-add16}
++EN=${EN:-$ROOT/wikitext-2-raw/wiki.valid.raw}
++ZH=${ZH:-$ROOT/accuracy-a8w8/ceval-val-corpus.txt}
++EN_REFERENCE=${EN_REFERENCE:-$ROOT/accuracy-a8w8/holdout-4096-add16-add18/en-fp16.kld}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,17-27}
++SKIP_EN=${SKIP_EN:-0}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++test -s "$EN_REFERENCE"
++
++ppl="$BUILD/bin/llama-perplexity"
++export LLAMA_PPL_REALISTIC_DECODE=1
++common=(-m "$MODEL" -ngl 99 -fa 0 -c 514 -b 514 -ub 514 --chunks 16 --seed 1234)
++
++if [[ "$SKIP_EN" != 1 ]]; then
++    echo "[en] selective A8W8 against completed FP16 reference"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" "${common[@]}" -f "$EN" \
++        --kl-divergence-base "$EN_REFERENCE" --kl-divergence \
++        2>&1 | tee "$OUT/en-candidate.log"
++fi
++
++zh_ref="$OUT/zh-fp16.kld"
++echo "[zh] FP16 reference"
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" -f "$ZH" --kl-divergence-base "$zh_ref" \
++    2>&1 | tee "$OUT/zh-fp16.log"
++
++echo "[zh] selective A8W8"
++env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" -f "$ZH" \
++    --kl-divergence-base "$zh_ref" --kl-divergence \
++    2>&1 | tee "$OUT/zh-candidate.log"
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-a8w8-holdout-speed.sh b/scripts/ascend310b-a8w8-holdout-speed.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..24a6557035738e57a4b7d04d1c75d641fd400457
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-holdout-speed.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/holdout-4096}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,16-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++for tokens in 64 256; do
++    echo "[tg$tokens] FP16/NZ, three repeats, batch=1, ubatch=1"
++    env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++        GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$BUILD/bin/llama-bench" -m "$MODEL" -p 0 -n "$tokens" -r 3 \
++        -b 1 -ub 1 -ngl 99 -fa 0 2>&1 | tee "$OUT/tg$tokens-fp16.log"
++    echo "[tg$tokens] selective A8W8, three repeats, batch=1, ubatch=1"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$BUILD/bin/llama-bench" -m "$MODEL" -p 0 -n "$tokens" -r 3 \
++        -b 1 -ub 1 -ngl 99 -fa 0 2>&1 | tee "$OUT/tg$tokens-candidate.log"
++done
+diff --git a/scripts/ascend310b-a8w8-holdout.sh b/scripts/ascend310b-a8w8-holdout.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..9edcd7bd87257d34520f02d7eb83d8e6e956bfa2
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-holdout.sh
+@@ -0,0 +1,42 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/holdout-4096}
++EN=${EN:-$ROOT/wikitext-2-raw/wiki.valid.raw}
++ZH=${ZH:-$ROOT/accuracy-a8w8/ceval-val-corpus.txt}
++CONTEXT=${CONTEXT:-514}
++CHUNKS=${CHUNKS:-16}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,16-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++for corpus in "$EN" "$ZH"; do test -s "$corpus"; done
++ppl="$BUILD/bin/llama-perplexity"
++export LLAMA_PPL_REALISTIC_DECODE=1
++common=(-m "$MODEL" -ngl 99 -fa 0 -c "$CONTEXT" -b "$CONTEXT" -ub "$CONTEXT" --chunks "$CHUNKS" --seed 1234)
++
++for lang in en zh; do
++    if [[ "$lang" == en ]]; then corpus="$EN"; else corpus="$ZH"; fi
++    ref="$OUT/$lang-fp16.kld"
++    echo "[$lang] FP16, $CONTEXT context, $CHUNKS chunks, batch=1, ubatch=1"
++    env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++        GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" "${common[@]}" -f "$corpus" --kl-divergence-base "$ref" \
++        2>&1 | tee "$OUT/$lang-fp16.log"
++
++    echo "[$lang] selective A8W8, FP16 layers $DISABLED_LAYERS, batch=1, ubatch=1"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "$ppl" "${common[@]}" -f "$corpus" \
++        --kl-divergence-base "$ref" --kl-divergence \
++        2>&1 | tee "$OUT/$lang-candidate.log"
++done
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-a8w8-layer-sensitivity.sh b/scripts/ascend310b-a8w8-layer-sensitivity.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fc035fb7d2526b30b8f90fde1654f381f6b5dcd
+--- /dev/null
++++ b/scripts/ascend310b-a8w8-layer-sensitivity.sh
+@@ -0,0 +1,43 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CORPUS=${CORPUS:-$ROOT/wikitext-2-raw/wiki.test.raw}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/layer-sensitivity}
++BASE=${BASE:-$ROOT/accuracy-a8w8/smoke/fp16-reference.kld}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++if [[ ! -f "$BASE" ]]; then
++    echo "missing FP16 reference: $BASE" >&2
++    echo "run scripts/ascend310b-a8w8-accuracy.sh smoke first" >&2
++    exit 1
++fi
++
++common=("$BUILD/bin/llama-perplexity" -m "$MODEL" -f "$CORPUS" -ngl 99 -fa 0 \
++        -c 128 -b 1 -ub 1 --chunks 1 --seed 1234 \
++        --kl-divergence-base "$BASE" --kl-divergence)
++
++for layers in 0-3 4-7 8-11 12-15 16-19 20-23 24-27; do
++    echo "Testing FP16 fallback for layers $layers"
++    env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$layers" \
++        GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++        GGML_CANN_TIED_OUTPUT_A8W8=off \
++        "${common[@]}" 2>&1 | tee "$OUT/layers-$layers.log"
++done
++
++python3 - "$OUT" <<'PY'
++import pathlib, re, sys
++print("\nblock,mean_kld,same_top_percent")
++for path in sorted(pathlib.Path(sys.argv[1]).glob("layers-*.log")):
++    text = path.read_text(errors="replace")
++    kld = re.search(r"Mean\s+KLD:\s+([0-9.eE+-]+)", text)
++    top = re.search(r"Same top p:\s+([0-9.eE+-]+)", text)
++    print(f"{path.stem.removeprefix('layers-')},{kld.group(1) if kld else 'NA'},{top.group(1) if top else 'NA'}")
++PY
+diff --git a/scripts/ascend310b-accuracy-data/fixed-20.json b/scripts/ascend310b-accuracy-data/fixed-20.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..0908d4cd7c7f4df331bf3ffd114c7370b57d873b
+--- /dev/null
++++ b/scripts/ascend310b-accuracy-data/fixed-20.json
+@@ -0,0 +1,22 @@
++[
++  {"id": 1, "question": "2 + 3 等于多少？A.4 B.5 C.6 D.7", "answer": "B"},
++  {"id": 2, "question": "17×6 等于多少？A.92 B.96 C.102 D.112", "answer": "C"},
++  {"id": 3, "question": "中国的首都是哪里？A.上海 B.广州 C.北京 D.深圳", "answer": "C"},
++  {"id": 4, "question": "水的化学式是什么？A.CO2 B.H2O C.O2 D.NaCl", "answer": "B"},
++  {"id": 5, "question": "一年通常有多少个月？A.10 B.11 C.12 D.13", "answer": "C"},
++  {"id": 6, "question": "地球绕哪一个天体公转？A.月球 B.太阳 C.火星 D.木星", "answer": "B"},
++  {"id": 7, "question": "正方形有几条边？A.3 B.4 C.5 D.6", "answer": "B"},
++  {"id": 8, "question": "如果所有猫都是动物，小白是一只猫，那么小白是什么？A.植物 B.动物 C.矿物 D.无法判断", "answer": "B"},
++  {"id": 9, "question": "苹果成熟后通常属于哪类食物？A.水果 B.谷物 C.肉类 D.调味品", "answer": "A"},
++  {"id": 10, "question": "把十进制数字10写成二进制。A.1001 B.1010 C.1100 D.1110", "answer": "B"},
++  {"id": 11, "question": "What is 9 squared? A.18 B.72 C.81 D.99", "answer": "C"},
++  {"id": 12, "question": "Which planet is known as the Red Planet? A.Venus B.Mars C.Jupiter D.Mercury", "answer": "B"},
++  {"id": 13, "question": "What is the opposite of 'hot'? A.cold B.fast C.tall D.dry", "answer": "A"},
++  {"id": 14, "question": "How many days are in a normal week? A.5 B.6 C.7 D.8", "answer": "C"},
++  {"id": 15, "question": "Which gas do humans need to breathe? A.oxygen B.helium C.neon D.argon", "answer": "A"},
++  {"id": 16, "question": "If a book costs $4, how much do three books cost? A.$7 B.$8 C.$12 D.$16", "answer": "C"},
++  {"id": 17, "question": "Which data structure follows first-in, first-out? A.stack B.queue C.tree D.set", "answer": "B"},
++  {"id": 18, "question": "In Python, which keyword defines a function? A.class B.import C.return D.def", "answer": "D"},
++  {"id": 19, "question": "Which number comes next: 2, 4, 6, 8? A.9 B.10 C.11 D.12", "answer": "B"},
++  {"id": 20, "question": "Which is the largest? A.0.5 B.0.05 C.0.005 D.0.0005", "answer": "A"}
++]
+diff --git a/scripts/ascend310b-accuracy-data/zh-quick.txt b/scripts/ascend310b-accuracy-data/zh-quick.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff49c2603482463f729c6a7e801e9b11abd6ee29
+--- /dev/null
++++ b/scripts/ascend310b-accuracy-data/zh-quick.txt
+@@ -0,0 +1,9 @@
++城市里的公共交通系统由地铁、公交车、自行车和步行道路共同组成。早高峰时，地铁能够在较短时间内运送大量乘客，但车站换乘和入口排队也会增加等待时间。合理的做法不是只扩建一条线路，而是根据客流数据调整班次，并让公交线路覆盖地铁难以到达的社区。对于短距离出行，安全连续的自行车道和人行道通常更加高效，也能减少道路拥堵和空气污染。
++
++农业生产受到温度、降水、土壤和市场需求等多种因素影响。农民会根据季节选择作物，并通过轮作保持土壤肥力。遇到持续干旱时，滴灌可以把水直接送到植物根部，从而减少蒸发。气象预报虽然不能消除风险，但能够帮助人们提前安排播种、灌溉和收获。建立稳定的仓储和运输系统同样重要，因为粮食在收获之后仍可能因潮湿、虫害或运输延误而损失。
++
++科学实验需要清楚记录问题、方法、数据和结论。一次测量可能受到仪器误差和环境变化的影响，因此研究人员通常会重复实验，并设置对照组。如果结果与预期不一致，首先应该检查实验条件和数据处理过程，而不是立即删除异常数据。其他研究者能够按照记录重复实验，是判断结论是否可靠的重要方式。随着新证据出现，原有解释也可能被修改，这并不代表科学失去可信度，而是说明知识会通过检验不断更新。
++
++计算机程序把复杂任务拆分成一系列明确步骤。程序员编写代码之后，会使用不同输入进行测试，检查正常情况、边界情况和错误情况。性能优化应当先测量真正耗时的部分，再修改算法或数据布局。只根据感觉改代码，可能增加复杂度却没有带来速度提升。完成修改后还需要与原版本比较输出，确认速度提高的同时没有破坏正确性。
++
++阅读一篇文章时，可以先判断作者讨论的主题，再区分事实、推断和观点。事实应当能够由可靠证据支持，推断需要说明从证据到结论的过程，而观点则可能受到个人经验和价值选择影响。面对互相矛盾的信息，应检查资料来源、发布日期和研究方法。单独一个例子往往不足以证明普遍规律，多份彼此独立且方法透明的证据更有说服力。
+diff --git a/scripts/ascend310b-ceval-corpus.py b/scripts/ascend310b-ceval-corpus.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ed196fe3b781ec3ea1c27ff639423c9f48942ab
+--- /dev/null
++++ b/scripts/ascend310b-ceval-corpus.py
+@@ -0,0 +1,36 @@
++#!/usr/bin/env python3
++"""Build an independent Chinese accuracy corpus from official C-Eval validation CSVs."""
++
++import argparse
++import csv
++import io
++import zipfile
++from pathlib import Path
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("zip_path", type=Path)
++    parser.add_argument("output", type=Path)
++    args = parser.parse_args()
++
++    blocks = []
++    with zipfile.ZipFile(args.zip_path) as archive:
++        names = sorted(name for name in archive.namelist() if name.startswith("val/") and name.endswith(".csv"))
++        for name in names:
++            raw = archive.read(name).decode("utf-8-sig")
++            for row in csv.DictReader(io.StringIO(raw)):
++                question = (row.get("question") or "").strip()
++                choices = [f"{letter}. {(row.get(letter) or '').strip()}" for letter in "ABCD"]
++                if question and all(row.get(letter) for letter in "ABCD"):
++                    blocks.append("题目：" + question + "\n" + "\n".join(choices) + "\n")
++
++    if not blocks:
++        raise RuntimeError("No C-Eval validation questions found")
++    args.output.parent.mkdir(parents=True, exist_ok=True)
++    args.output.write_text("\n".join(blocks), encoding="utf-8")
++    print(f"wrote {len(blocks)} validation questions to {args.output}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/ascend310b-fixed20.py b/scripts/ascend310b-fixed20.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cdffb1759097394b4a0a90286ceaad249f60bd1
+--- /dev/null
++++ b/scripts/ascend310b-fixed20.py
+@@ -0,0 +1,41 @@
++#!/usr/bin/env python3
++import argparse
++import json
++import pathlib
++import re
++import subprocess
++
++
++def main():
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--cli", required=True)
++    parser.add_argument("--model", required=True)
++    parser.add_argument("--questions", required=True)
++    parser.add_argument("--output", required=True)
++    parser.add_argument("--mode", choices=["fp16", "candidate"], required=True)
++    args = parser.parse_args()
++
++    questions = json.loads(pathlib.Path(args.questions).read_text(encoding="utf-8"))
++    prompt = ["Answer all questions. Output exactly 20 lines in the form 1:B. Do not explain."]
++    prompt.extend(f"{item['id']}. {item['question']}" for item in questions)
++    prompt_text = "\n".join(prompt)
++    command = [args.cli, "-m", args.model, "-ngl", "99", "-b", "1", "-ub", "1",
++               "-n", "100", prompt_text]
++    completed = subprocess.run(command, text=True, capture_output=True, timeout=300)
++    raw = completed.stdout
++    found = {int(i): answer for i, answer in re.findall(r"(?m)^\s*(\d{1,2})\s*[:.)-]\s*([A-D])\b", raw.upper())}
++    results = []
++    for item in questions:
++        predicted = found.get(item["id"], "")
++        results.append({**item, "predicted": predicted, "correct": predicted == item["answer"]})
++    score = sum(x["correct"] for x in results)
++    report = {"mode": args.mode, "score": score, "total": len(results),
++              "raw": raw, "stderr": completed.stderr, "returncode": completed.returncode,
++              "results": results}
++    pathlib.Path(args.output).parent.mkdir(parents=True, exist_ok=True)
++    pathlib.Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
++    print(f"{args.mode}: {score}/{len(results)}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/ascend310b-layer-cosine.sh b/scripts/ascend310b-layer-cosine.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..680f08bda2498ee2aff63ace249655e95de09928
+--- /dev/null
++++ b/scripts/ascend310b-layer-cosine.sh
+@@ -0,0 +1,34 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++OUT=${OUT:-$ROOT/accuracy-a8w8/layer-cosine-add16}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,17-27}
++PROMPT=${PROMPT:-'请用简洁语言解释量化模型如何减少计算量，并比较整数矩阵乘法与浮点矩阵乘法。 Explain why careful numerical validation is required after quantizing a language model.'}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++runner="$BUILD/bin/llama-eval-callback"
++common=(-m "$MODEL" -p "$PROMPT" -c 256 -b 1 -ub 1 -ngl 99 -fa 0 --seed 1234)
++
++env LLAMA_LAYER_DUMP="$OUT/fp16.bin" \
++    GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$runner" "${common[@]}" > "$OUT/fp16.log" 2>&1
++
++env LLAMA_LAYER_DUMP="$OUT/candidate.bin" \
++    GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$runner" "${common[@]}" > "$OUT/candidate.log" 2>&1
++
++python3 "$ROOT/scripts/compare-layer-dumps.py" \
++    "$OUT/fp16.bin" "$OUT/candidate.bin" --output "$OUT/layer-cosine.csv" \
++    | tee "$OUT/layer-cosine.txt"
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-ppl-logical-batch-check.sh b/scripts/ascend310b-ppl-logical-batch-check.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1747197ad4314eb1ca242411f079b33483854b8
+--- /dev/null
++++ b/scripts/ascend310b-ppl-logical-batch-check.sh
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++CORPUS=${CORPUS:-$ROOT/accuracy-a8w8/ceval-val-corpus.txt}
++OUT=${OUT:-$ROOT/accuracy-a8w8/logical-batch-check}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,17-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++mkdir -p "$OUT"
++
++ppl="$BUILD/bin/llama-perplexity"
++# n_batch is only the logical submission size. n_ubatch=1 keeps every physical
++# graph at one token, which is required by the 310B A8W8 decode operator.
++common=(-m "$MODEL" -f "$CORPUS" -ngl 99 -fa 0 -c 514 -b 514 -ub 1 --chunks 1 --seed 1234)
++
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" --kl-divergence-base "$OUT/fp16.kld" \
++    2>&1 | tee "$OUT/fp16.log"
++
++env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" --kl-divergence-base "$OUT/fp16.kld" --kl-divergence \
++    2>&1 | tee "$OUT/candidate.log"
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-ppl-realistic-decode-check.sh b/scripts/ascend310b-ppl-realistic-decode-check.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e41fff926498a7de03a25ac9b335c91d36576c0
+--- /dev/null
++++ b/scripts/ascend310b-ppl-realistic-decode-check.sh
+@@ -0,0 +1,33 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++ROOT=${ROOT:-/home/HwHiAiUser/llama-cpp-310b}
++BUILD=${BUILD:-$ROOT/build-a8w8}
++MODEL=${MODEL:-$ROOT/qwen2.5-1.5b-instruct-f16.gguf}
++CUSTOM_OPP=${CUSTOM_OPP:-/home/HwHiAiUser/a8w8-probe/install_a8w8_nz/vendors/customize}
++CORPUS=${CORPUS:-$ROOT/accuracy-a8w8/ceval-val-corpus.txt}
++OUT=${OUT:-$ROOT/accuracy-a8w8/realistic-decode-check}
++DISABLED_LAYERS=${DISABLED_LAYERS:-0-7,13,17-27}
++
++source /usr/local/Ascend/ascend-toolkit/set_env.sh
++export ASCEND_CUSTOM_OPP_PATH="$CUSTOM_OPP"
++export LD_LIBRARY_PATH="$CUSTOM_OPP/op_api/lib:/usr/local/Ascend/ascend-toolkit/latest/lib64:${LD_LIBRARY_PATH:-}"
++export LLAMA_PPL_REALISTIC_DECODE=1
++mkdir -p "$OUT"
++
++ppl="$BUILD/bin/llama-perplexity"
++# The first half is a batched FP16 prefill. The scored half is decoded one token
++# at a time, so it exercises the same M=1 A8W8 path used during generation.
++common=(-m "$MODEL" -f "$CORPUS" -ngl 99 -fa 0 -c 514 -b 514 -ub 514 --chunks 1 --seed 1234)
++
++env GGML_CANN_A8W8=off GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on \
++    GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" --kl-divergence-base "$OUT/fp16.kld" \
++    2>&1 | tee "$OUT/fp16.log"
++
++env GGML_CANN_A8W8=on GGML_CANN_A8W8_DISABLE_LAYERS="$DISABLED_LAYERS" \
++    GGML_CANN_WEIGHT_NZ=on GGML_CANN_TIED_OUTPUT_NZ=on GGML_CANN_TIED_OUTPUT_A8W8=off \
++    "$ppl" "${common[@]}" --kl-divergence-base "$OUT/fp16.kld" --kl-divergence \
++    2>&1 | tee "$OUT/candidate.log"
++
++echo "completed: $OUT"
+diff --git a/scripts/ascend310b-qwen25-15b-baseline.sh b/scripts/ascend310b-qwen25-15b-baseline.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b7190e37df939a3aae6e22f3ea333663bab4a69
+--- /dev/null
++++ b/scripts/ascend310b-qwen25-15b-baseline.sh
+@@ -0,0 +1,58 @@
++#!/usr/bin/env bash
++set -euo pipefail
++
++# Run on the 310B4 board after sourcing CANN set_env.sh.
++# Usage: ./scripts/ascend310b-qwen25-15b-baseline.sh MODEL.gguf [LLAMA_BENCH] [OUTPUT_DIR]
++model=${1:?Usage: $0 MODEL.gguf [LLAMA_BENCH] [OUTPUT_DIR]}
++bench=${2:-./build-cann85/bin/llama-bench}
++output_dir=${3:-./qwen25-15b-baseline-$(date +%Y%m%d-%H%M%S)}
++
++if [[ ! -s "$model" ]]; then
++    echo "Model file does not exist or is empty: $model" >&2
++    exit 1
++fi
++if [[ ! -x "$bench" ]]; then
++    echo "llama-bench is not executable: $bench" >&2
++    exit 1
++fi
++
++mkdir -p "$output_dir"
++output_dir=$(cd "$output_dir" && pwd)
++model=$(cd "$(dirname "$model")" && pwd)/$(basename "$model")
++bench=$(cd "$(dirname "$bench")" && pwd)/$(basename "$bench")
++
++{
++    printf 'date=%s\n' "$(date -Is)"
++    printf 'model=%s\n' "$model"
++    printf 'model_bytes=%s\n' "$(stat -c %s "$model")"
++    printf 'bench=%s\n' "$bench"
++    printf 'GGML_CANN_WEIGHT_NZ=%s\n' "${GGML_CANN_WEIGHT_NZ:-off}"
++    printf 'ASCEND_CUSTOM_OPP_PATH=%s\n' "${ASCEND_CUSTOM_OPP_PATH:-unset}"
++    printf 'parameters=ngl:99,fa:off,repetitions:3\n'
++    npu-smi info 2>&1 || true
++} > "$output_dir/environment.txt"
++
++failures=0
++
++run_case() {
++    local name=$1
++    local prompt=$2
++    local generated=$3
++    echo "Running $name (3 repetitions)..."
++    if "$bench" -m "$model" -p "$prompt" -n "$generated" -r 3 -ngl 99 -fa off \
++        2>&1 | tee "$output_dir/$name.log"; then
++        printf '%s=PASS\n' "$name" >> "$output_dir/status.txt"
++    else
++        local bench_status=${PIPESTATUS[0]}
++        printf '%s=FAIL(exit=%s)\n' "$name" "$bench_status" | tee -a "$output_dir/status.txt"
++        failures=1
++    fi
++}
++
++run_case pp128 128 0
++run_case pp512 512 0
++run_case tg64 0 64
++run_case tg256 0 256
++
++echo "Saved baseline results to $output_dir"
++exit "$failures"
+diff --git a/scripts/compare-layer-dumps.py b/scripts/compare-layer-dumps.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4272cb279269f97045006ee03f2e1f91983cdd6
+--- /dev/null
++++ b/scripts/compare-layer-dumps.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++"""Compare FP32-normalized ffn_out/l_out records from llama-eval-callback."""
++
++import argparse
++import array
++import math
++import re
++import struct
++from collections import defaultdict
++from pathlib import Path
++
++
++def read_dump(path: Path):
++    records = defaultdict(list)
++    with path.open("rb") as stream:
++        if stream.read(8) != b"LLDUMP1\0":
++            raise ValueError(f"bad dump header: {path}")
++        while True:
++            raw = stream.read(2)
++            if not raw:
++                break
++            if len(raw) != 2:
++                raise EOFError(path)
++            name_len = struct.unpack("<H", raw)[0]
++            name = stream.read(name_len).decode("utf-8")
++            count = struct.unpack("<Q", stream.read(8))[0]
++            values = array.array("f")
++            values.fromfile(stream, count)
++            records[name].append(values)
++    return records
++
++
++def metric(reference, candidate):
++    if len(reference) != len(candidate):
++        raise ValueError("record count mismatch")
++    dot = ref2 = cand2 = diff2 = 0.0
++    count = 0
++    for left, right in zip(reference, candidate):
++        if len(left) != len(right):
++            raise ValueError("tensor size mismatch")
++        for a, b in zip(left, right):
++            dot += a * b
++            ref2 += a * a
++            cand2 += b * b
++            d = b - a
++            diff2 += d * d
++        count += len(left)
++    cosine = dot / math.sqrt(ref2 * cand2) if ref2 and cand2 else float("nan")
++    rel_l2 = math.sqrt(diff2 / ref2) if ref2 else float("nan")
++    return count, cosine, rel_l2
++
++
++def layer_number(name: str) -> int:
++    match = re.search(r"-(\d+)$", name)
++    return int(match.group(1)) if match else -1
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("reference", type=Path)
++    parser.add_argument("candidate", type=Path)
++    parser.add_argument("--output", type=Path)
++    args = parser.parse_args()
++
++    reference = read_dump(args.reference)
++    candidate = read_dump(args.candidate)
++    rows = []
++    previous_l_out_error = 0.0
++    names = sorted(set(reference) & set(candidate), key=lambda name: (layer_number(name), name))
++    for name in names:
++        count, cosine, rel_l2 = metric(reference[name], candidate[name])
++        error = 1.0 - cosine
++        amplification = ""
++        if name.startswith("l_out-"):
++            amplification = f"{error - previous_l_out_error:.9g}"
++            previous_l_out_error = error
++        rows.append(f"{layer_number(name)},{name},{count},{cosine:.9g},{rel_l2:.9g},{amplification}")
++
++    text = "layer,tensor,values,cosine,relative_l2,cumulative_error_delta\n" + "\n".join(rows) + "\n"
++    if args.output:
++        args.output.write_text(text, encoding="utf-8")
++    print(text, end="")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5855393ef7cc6328fb9d21f47e13f68a01e2b252..f6d763d6bd27c1d35f9904ec24492f5dfd090c06 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -64,6 +64,37 @@ static bool can_reuse_kq_mask(
+     return res;
+ }
+ 
++template <typename T>
++static void set_input_kv_lengths_impl(ggml_tensor * dst, const ggml_tensor * mask, const T * data) {
++    const int64_t n_kv = mask->ne[0];
++    const int64_t n_rows = ggml_nelements(mask) / n_kv;
++    GGML_ASSERT(ggml_nelements(dst) == n_rows);
++
++    std::vector<int32_t> lengths(n_rows);
++    for (int64_t row = 0; row < n_rows; ++row) {
++        int64_t length = n_kv;
++        while (length > 0 && !std::isfinite(llama_cast<float>(data[row*n_kv + length - 1]))) {
++            --length;
++        }
++        lengths[row] = static_cast<int32_t>(std::max<int64_t>(length, 1));
++    }
++
++    ggml_backend_tensor_set(dst, lengths.data(), 0, lengths.size() * sizeof(lengths[0]));
++}
++
++static void set_input_kv_lengths(ggml_tensor * dst, const ggml_tensor * mask) {
++    GGML_ASSERT(dst && mask);
++    GGML_ASSERT(dst->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_backend_buffer_is_host(mask->buffer));
++
++    if (mask->type == GGML_TYPE_F16) {
++        set_input_kv_lengths_impl(dst, mask, (const ggml_fp16_t *) mask->data);
++    } else {
++        GGML_ASSERT(mask->type == GGML_TYPE_F32);
++        set_input_kv_lengths_impl(dst, mask, (const float *) mask->data);
++    }
++}
++
+ // impl
+ 
+ void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
+@@ -475,6 +506,9 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+     // (e.g. DFlash's KV-injection pass)
+     if (self_kq_mask && self_kq_mask->buffer) {
+         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
++        if (self_kv_lengths && self_kv_lengths->buffer) {
++            set_input_kv_lengths(self_kv_lengths, self_kq_mask);
++        }
+     }
+ 
+     if (self_k_rot && self_k_rot->buffer) {
+@@ -497,6 +531,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
++    if (self_kv_lengths) {
++        res &= self_kv_lengths->ne[0] == params.ubatch.n_tokens;
++    }
+ 
+     return res;
+ }
+@@ -2594,6 +2631,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * v,
+          ggml_tensor * kq_b,
+          ggml_tensor * kq_mask,
++         ggml_tensor * kv_lengths,
+          ggml_tensor * sinks,
+          ggml_tensor * v_mla,
+              int64_t   n_kv_max,
+@@ -2634,6 +2672,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
+         ggml_flash_attn_ext_add_sinks(cur, sinks);
++        ggml_flash_attn_ext_add_kv_lengths(cur, kv_lengths);
+         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
+@@ -2785,7 +2824,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -2820,6 +2859,12 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+ 
+         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+         inp->self_kq_mask_cnv = inp->self_kq_mask;
++
++        if (cparams.flash_attn) {
++            inp->self_kv_lengths = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
++            ggml_set_input(inp->self_kv_lengths);
++            ggml_set_name(inp->self_kv_lengths, "attn_inp_kv_lengths");
++        }
+     }
+ 
+     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
+@@ -2884,7 +2929,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, inp->get_kv_lengths(), sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (inp->self_v_rot) {
+@@ -2975,7 +3020,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -3060,7 +3105,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, top_k->ne[0], kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, sinks, v_mla, top_k->ne[0], kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+@@ -3139,7 +3184,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (v_rot) {
+@@ -3210,7 +3255,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (k_rot) {
+@@ -3269,7 +3314,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = k_cur;
+     ggml_tensor * v = v_cur;
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, nullptr, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index cc4110639d4b8417564b34baa99475e026f8b7db..ccdc66c7c4820c072ac91457ea3835b75dc3ff6b 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -338,12 +338,14 @@ public:
+     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
+ 
+     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
++    ggml_tensor * get_kv_lengths() const { return self_kv_lengths; }
+ 
+     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
+     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
+ 
+     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
++    ggml_tensor * self_kv_lengths  = nullptr; // I32     [n_batch]
+ 
+     // note: assumes v_rot^2 == I
+     ggml_tensor * self_k_rot = nullptr;
+@@ -1183,6 +1185,7 @@ struct llm_graph_context {
+             ggml_tensor * v,       // [n_embd_head_v, n_head_v, n_tokens] (v_trans = false)
+             ggml_tensor * kq_b,
+             ggml_tensor * kq_mask,
++            ggml_tensor * kv_lengths,
+             ggml_tensor * sinks,   // [n_head_q]
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                 int64_t   n_kv_max,
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 6bf9d34449426504cea436531118eb9b13941f20..f572e502e8775faf0ca380617bafb7c40e4981b0 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -758,7 +758,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
+     cb(kq_mask, "csa_lid_kq_mask", il);
+ 
+     const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, n_kv_max, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, sinks, nullptr, n_kv_max, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+@@ -813,7 +813,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
+     ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, hca_mask, 0);
+     cb(kq_mask, "hca_kq_mask", il);
+ 
+-    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+@@ -849,7 +849,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_raw_attention(
+ 
+     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+ 
+-    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, sinks, nullptr, 0, kq_scale, il);
++    ggml_tensor * out = build_attn_mha(q, k, k, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
+     if (k_rot) {
+         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+     }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 8ace95f73475537eda0fbb4933e65f38f19ce0e5..c1fd5c7c494ad20d88a13b9bf1b5d901b93e0007 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -746,8 +746,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
+ 
+     // TODO: enable sparse attention when we are ready
+     // ref: https://github.com/ggml-org/llama.cpp/pull/27970
+-    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, 0, kq_scale, il);
++    //ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, top_k->ne[0], kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, nullptr, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
+     // the rotation is its own inverse, so undo it on the value side of the output
+diff --git a/tools/perplexity/perplexity.cpp b/tools/perplexity/perplexity.cpp
+index ba41287d8e3d94a6a7c50d0c5bd3de65d9cae2d7..8e38db24adbf9a4c9041b3d74bc76cecc0b963b3 100644
+--- a/tools/perplexity/perplexity.cpp
++++ b/tools/perplexity/perplexity.cpp
+@@ -11,6 +11,7 @@
+ #include <clocale>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <ctime>
+ #include <fstream>
+@@ -503,14 +504,32 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+ 
+     const int num_batches = (n_ctx + n_batch - 1) / n_batch;
+     const int n_seq = std::max(1, n_batch / n_ctx);
++    const char * realistic_decode_env = std::getenv("LLAMA_PPL_REALISTIC_DECODE");
++    const bool realistic_decode = realistic_decode_env != nullptr && std::strcmp(realistic_decode_env, "0") != 0;
+ 
+     GGML_ASSERT(n_batch < n_ctx || n_batch % n_ctx == 0);
+     GGML_ASSERT(params.n_ctx == n_seq * n_ctx);
++    GGML_ASSERT(!realistic_decode || (n_seq == 1 && n_batch >= n_ctx/2));
++
++    llama_context_ptr decode_ctx;
++    if (realistic_decode) {
++        common_params decode_params = params;
++        decode_params.n_ctx      = n_ctx;
++        decode_params.n_parallel = 1;
++        decode_params.n_batch    = 1;
++        decode_params.n_ubatch   = 1;
++        decode_ctx.reset(llama_init_from_model(
++                const_cast<llama_model *>(llama_get_model(ctx)), common_context_params_to_llama(decode_params)));
++        if (!decode_ctx) {
++            LOG_ERR("%s: failed to create the single-token decode context\n", __func__);
++            return {tokens, -1, logit_history, prob_history};
++        }
++    }
+ 
+     llama_batch batch = llama_batch_init(std::min(n_batch, n_ctx*n_seq), 0, 1);
+ 
+     std::vector<float> logits;
+-    if (num_batches > 1) {
++    if (num_batches > 1 || realistic_decode) {
+         logits.reserve(size_t(n_ctx) * n_vocab);
+     }
+ 
+@@ -541,6 +560,11 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+     // process the entire prompt.
+     const int first = n_ctx/2;
+ 
++    if (realistic_decode) {
++        LOG_INF("%s: realistic decode mode: %d-token batched prefill, then single-token decode\n",
++                __func__, first);
++    }
++
+     for (int i = 0; i < n_chunk; i += n_seq) {
+         const int start =     i * n_ctx;
+         const int end   = start + n_ctx;
+@@ -551,10 +575,16 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+ 
+         // clear the KV cache
+         llama_memory_clear(llama_get_memory(ctx), true);
++        if (decode_ctx) {
++            llama_memory_clear(llama_get_memory(decode_ctx.get()), true);
++        }
+ 
+-        for (int j = 0; j < num_batches; ++j) {
+-            const int batch_start = start + j * n_batch;
+-            const int batch_size  = std::min(end - batch_start, n_batch);
++        int chunk_pos = 0;
++        for (int j = 0; chunk_pos < n_ctx; ++j) {
++            const int batch_start = start + chunk_pos;
++            const int batch_size  = realistic_decode
++                    ? (chunk_pos == 0 ? first : 1)
++                    : std::min(end - batch_start, n_batch);
+ 
+             int n_outputs = 0;
+ 
+@@ -566,14 +596,14 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+                 const auto token_org = tokens[seq_start];
+ 
+                 // add BOS token for the first batch of each chunk
+-                if (add_bos && j == 0) {
++                if (add_bos && chunk_pos == 0) {
+                     tokens[seq_start] = llama_vocab_bos(vocab);
+                 }
+ 
+                 for (int k = 0; k < batch_size; ++k) {
+                     const int idx = seq*n_ctx + k;
+                     batch.token   [idx]    = tokens[seq_start + k];
+-                    batch.pos     [idx]    = j*n_batch + k;
++                    batch.pos     [idx]    = chunk_pos + k;
+                     batch.n_seq_id[idx]    = 1;
+                     batch.seq_id  [idx][0] = seq;
+                     batch.logits  [idx]    = batch.pos[idx] >= first ? 1 : 0;
+@@ -586,20 +616,37 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+                 tokens[seq_start] = token_org;
+             }
+ 
+-            if (llama_decode(ctx, batch)) {
++            llama_context * active_ctx = realistic_decode && chunk_pos > 0 ? decode_ctx.get() : ctx;
++            if (llama_decode(active_ctx, batch)) {
+                 LOG_INF("%s : failed to decode\n", __func__);
+                 return {tokens, -1, logit_history, prob_history};
+             }
+ 
+-            if (num_batches > 1 && n_outputs > 0) {
+-                const auto * batch_logits = llama_get_logits(ctx);
++            if (realistic_decode && chunk_pos == 0) {
++                llama_synchronize(ctx);
++                const size_t state_size = llama_state_seq_get_size(ctx, 0);
++                std::vector<uint8_t> state(state_size);
++                if (llama_state_seq_get_data(ctx, state.data(), state.size(), 0) != state_size ||
++                    llama_state_seq_set_data(decode_ctx.get(), state.data(), state.size(), 0) != state_size) {
++                    LOG_ERR("%s: failed to transfer the prefill KV cache to the decode context\n", __func__);
++                    return {tokens, -1, logit_history, prob_history};
++                }
++            }
++
++            if ((num_batches > 1 || realistic_decode) && n_outputs > 0) {
++                const auto * batch_logits = llama_get_logits(active_ctx);
+                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
+             }
++
++            chunk_pos += batch_size;
+         }
+ 
+ 
+         if (i == 0) {
+             llama_synchronize(ctx);
++            if (decode_ctx) {
++                llama_synchronize(decode_ctx.get());
++            }
+             const auto t_end = std::chrono::high_resolution_clock::now();
+             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
+             LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
+@@ -612,7 +659,9 @@ static results_perplexity perplexity(llama_context * ctx, const common_params &
+         }
+ 
+         for (int seq = 0; seq < n_seq_batch; seq++) {
+-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
++            const float * all_logits = (num_batches > 1 || realistic_decode)
++                    ? logits.data()
++                    : llama_get_logits_ith(ctx, seq*n_ctx + first);
+ 
+             llama_token * tokens_data = tokens.data() + start + seq*n_ctx + first;
+             if (!params.logits_file.empty()) {
+@@ -1749,6 +1798,24 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 __func__, n_seq, n_seq_max, n_seq_max);
+         n_seq = n_seq_max;
+     }
++    const char * realistic_decode_env = std::getenv("LLAMA_PPL_REALISTIC_DECODE");
++    const bool realistic_decode = realistic_decode_env != nullptr && std::strcmp(realistic_decode_env, "0") != 0;
++    GGML_ASSERT(!realistic_decode || (n_seq == 1 && n_batch >= static_cast<int>(n_ctx/2)));
++
++    llama_context_ptr decode_ctx;
++    if (realistic_decode) {
++        common_params decode_params = params;
++        decode_params.n_ctx      = n_ctx;
++        decode_params.n_parallel = 1;
++        decode_params.n_batch    = 1;
++        decode_params.n_ubatch   = 1;
++        decode_ctx.reset(llama_init_from_model(
++                const_cast<llama_model *>(llama_get_model(ctx)), common_context_params_to_llama(decode_params)));
++        if (!decode_ctx) {
++            LOG_ERR("%s: failed to create the single-token decode context\n", __func__);
++            return;
++        }
++    }
+     const int nv = 2*((n_vocab + 1)/2) + 4;
+     const bool add_bos = llama_vocab_get_add_bos(vocab);
+     GGML_ASSERT(!llama_vocab_get_add_eos(vocab));
+@@ -1759,7 +1826,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+     std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+     std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+     std::vector<float> logits;
+-    if (num_batches > 1) {
++    if (num_batches > 1 || realistic_decode) {
+         logits.reserve(size_t(n_ctx) * n_vocab);
+     }
+ 
+@@ -1791,6 +1858,11 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+     const int first = n_ctx/2;
+ 
++    if (realistic_decode) {
++        LOG_INF("%s: realistic decode mode: %d-token batched prefill, then single-token decode\n",
++                __func__, first);
++    }
++
+     for (int i = 0; i < n_chunk; i += n_seq) {
+         const int start =     i * n_ctx;
+         const int end   = start + n_ctx;
+@@ -1801,10 +1873,16 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+ 
+         // clear the KV cache
+         llama_memory_clear(llama_get_memory(ctx), true);
++        if (decode_ctx) {
++            llama_memory_clear(llama_get_memory(decode_ctx.get()), true);
++        }
+ 
+-        for (int j = 0; j < num_batches; ++j) {
+-            const int batch_start = start + j * n_batch;
+-            const int batch_size  = std::min(end - batch_start, n_batch);
++        int chunk_pos = 0;
++        for (int j = 0; chunk_pos < static_cast<int>(n_ctx); ++j) {
++            const int batch_start = start + chunk_pos;
++            const int batch_size  = realistic_decode
++                    ? (chunk_pos == 0 ? first : 1)
++                    : std::min(end - batch_start, n_batch);
+ 
+             int n_outputs = 0;
+ 
+@@ -1816,12 +1894,12 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 const auto token_org = tokens[seq_start];
+ 
+                 // add BOS token for the first batch of each chunk
+-                if (add_bos && j == 0) {
++                if (add_bos && chunk_pos == 0) {
+                     tokens[seq_start] = llama_vocab_bos(vocab);
+                 }
+ 
+                 for (int k = 0; k < batch_size; ++k) {
+-                    const int pos = j*n_batch + k;
++                    const int pos = chunk_pos + k;
+                     const bool need_logits = pos >= first;
+                     common_batch_add(batch, tokens[seq_start + k], pos, { seq }, need_logits);
+                     n_outputs += need_logits;
+@@ -1831,20 +1909,38 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 tokens[seq_start] = token_org;
+             }
+ 
+-            if (llama_decode(ctx, batch)) {
++            llama_context * active_ctx = realistic_decode && chunk_pos > 0 ? decode_ctx.get() : ctx;
++            if (llama_decode(active_ctx, batch)) {
+                 LOG_ERR("%s : failed to decode\n", __func__);
+                 llama_batch_free(batch);
+                 return;
+             }
+ 
+-            if (num_batches > 1 && n_outputs > 0) {
+-                const auto * batch_logits = llama_get_logits(ctx);
++            if (realistic_decode && chunk_pos == 0) {
++                llama_synchronize(ctx);
++                const size_t state_size = llama_state_seq_get_size(ctx, 0);
++                std::vector<uint8_t> state(state_size);
++                if (llama_state_seq_get_data(ctx, state.data(), state.size(), 0) != state_size ||
++                    llama_state_seq_set_data(decode_ctx.get(), state.data(), state.size(), 0) != state_size) {
++                    LOG_ERR("%s: failed to transfer the prefill KV cache to the decode context\n", __func__);
++                    llama_batch_free(batch);
++                    return;
++                }
++            }
++
++            if ((num_batches > 1 || realistic_decode) && n_outputs > 0) {
++                const auto * batch_logits = llama_get_logits(active_ctx);
+                 logits.insert(logits.end(), batch_logits, batch_logits + size_t(n_outputs) * n_vocab);
+             }
++
++            chunk_pos += batch_size;
+         }
+ 
+         if (i == 0) {
+             llama_synchronize(ctx);
++            if (decode_ctx) {
++                llama_synchronize(decode_ctx.get());
++            }
+             const auto t_end = std::chrono::high_resolution_clock::now();
+             const float t_total = std::chrono::duration<float>(t_end - t_start).count();
+             LOG_INF("%s: %.2f seconds per pass - ETA ", __func__, t_total);
+@@ -1866,7 +1962,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
+                 return;
+             }
+ 
+-            const float * all_logits = num_batches > 1 ? logits.data() : llama_get_logits_ith(ctx, seq*n_ctx + first);
++            const float * all_logits = (num_batches > 1 || realistic_decode)
++                    ? logits.data()
++                    : llama_get_logits_ith(ctx, seq*n_ctx + first);
+ 
+             process_logits(n_vocab, all_logits, tokens.data() + start + seq*n_ctx + first, n_ctx - 1 - first,
+                     workers, log_probs_uint16, kld, kld_ptr, p_diff_ptr);
